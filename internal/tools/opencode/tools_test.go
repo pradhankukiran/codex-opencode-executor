@@ -287,14 +287,16 @@ func TestToolHandlers(t *testing.T) {
 	// 5. createSessionHandler
 	{
 		h := createSessionHandler(client, ExecutorOptions{
-			DefaultModel: ModelRef{ProviderID: "xai", ModelID: "grok-4.5"},
-			DefaultAgent: "build",
+			DefaultModel:      ModelRef{ProviderID: "xai", ModelID: "grok-4.5"},
+			DefaultAgent:      "build",
+			DefaultPermission: PermissionModeYOLO,
 		})
 		_, res, err := h(t.Context(), nil, createSessionParams{Title: "New Session"})
 		require.NoError(t, err)
 		require.Equal(t, "ses-new", res.SessionID)
 		require.Equal(t, "xai/grok-4.5", res.Model)
 		require.Equal(t, "build", res.Agent)
+		require.Equal(t, "yolo", res.PermissionMode)
 	}
 
 	// 6. fireHandler

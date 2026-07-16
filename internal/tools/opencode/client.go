@@ -298,6 +298,15 @@ func (c *Client) CreateSession(ctx context.Context, loc Location, req CreateSess
 	if req.Agent != "" {
 		body.Agent.SetTo(req.Agent)
 	}
+	if action, ok := req.Permission.action(); ok {
+		body.Permission = api.PermissionRuleset{
+			{
+				Permission: "*",
+				Pattern:    "*",
+				Action:     api.PermissionAction(action),
+			},
+		}
+	}
 	if req.ProviderID != "" || req.ModelID != "" {
 		body.Model.SetTo(api.SessionCreateReqModel{
 			ProviderID: req.ProviderID,

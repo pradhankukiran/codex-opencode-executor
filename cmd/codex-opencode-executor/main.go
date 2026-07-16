@@ -25,6 +25,7 @@ import (
 const (
 	defaultLocalOpencodeURL = "http://localhost:4096"
 	defaultExecutorModel    = "xai/grok-4.5"
+	defaultPermissionMode   = "inherit"
 )
 
 type repeatFlag []string
@@ -56,7 +57,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	client, closeClient, err := ocode.Create(ctx, logger)
+	client, closeClient, err := ocode.Create(ctx, logger, executorOpts.DefaultPermission)
 	if err != nil {
 		slog.Error("create opencode client", "err", err)
 		os.Exit(1)
@@ -100,6 +101,8 @@ type opencodeCfg struct {
 	LogAPI           bool
 	DefaultModel     string
 	DefaultAgent     string
+	PermissionMode   string
+	YOLO             bool
 
 	BaseURL  string
 	Username string
@@ -117,6 +120,8 @@ func (o *opencodeCfg) Register(_ *flag.FlagSet) {
 	flag.StringVar(&o.StateDir, "state-dir", envDefault("CODEX_OPENCODE_EXECUTOR_STATE_DIR", defaultStateDir()), "directory for persisting job state across restarts (env: CODEX_OPENCODE_EXECUTOR_STATE_DIR)")
 	flag.StringVar(&o.DefaultModel, "default-model", envDefault("CODEX_OPENCODE_EXECUTOR_DEFAULT_MODEL", defaultExecutorModel), "default model for new sessions in provider/model form; pass an empty value to use opencode's default (env: CODEX_OPENCODE_EXECUTOR_DEFAULT_MODEL)")
 	flag.StringVar(&o.DefaultAgent, "default-agent", os.Getenv("CODEX_OPENCODE_EXECUTOR_DEFAULT_AGENT"), "default opencode agent for new sessions and prompts; empty uses opencode's default (env: CODEX_OPENCODE_EXECUTOR_DEFAULT_AGENT)")
+	flag.StringVar(&o.PermissionMode, "permission-mode", envDefault("CODEX_OPENCODE_EXECUTOR_PERMISSION_MODE", defaultPermissionMode), "default permission mode for new sessions: inherit, ask, deny, or yolo (env: CODEX_OPENCODE_EXECUTOR_PERMISSION_MODE)")
+	flag.BoolVar(&o.YOLO, "yolo", false, "shortcut for -permission-mode=yolo")
 	flag.BoolVar(&o.LogAPI, "log-api", false, "log opencode HTTP request/response bodies at debug level (requires -log-level debug or -log-file)")
 	flag.StringVar(&o.BaseURL, "opencode-url", os.Getenv("OPENCODE_URL"), "opencode server base URL (env: OPENCODE_URL); defaults to localhost on random port in local mode")
 	flag.StringVar(&o.Username, "opencode-username", envDefault("OPENCODE_USERNAME", "opencode"), "opencode basic auth username (env: OPENCODE_USERNAME)")
@@ -130,13 +135,21 @@ func (o *opencodeCfg) ExecutorOptions() (opencode.ExecutorOptions, error) {
 	if err != nil {
 		return opencode.ExecutorOptions{}, fmt.Errorf("parse default model: %w", err)
 	}
+	permission, err := opencode.ParsePermissionMode(o.PermissionMode)
+	if err != nil {
+		return opencode.ExecutorOptions{}, err
+	}
+	if o.YOLO {
+		permission = opencode.PermissionModeYOLO
+	}
 	return opencode.ExecutorOptions{
-		DefaultModel: model,
-		DefaultAgent: strings.TrimSpace(o.DefaultAgent),
+		DefaultModel:      model,
+		DefaultAgent:      strings.TrimSpace(o.DefaultAgent),
+		DefaultPermission: permission,
 	}, nil
 }
 
-func (o *opencodeCfg) Create(ctx context.Context, lg *slog.Logger) (*opencode.Client, func(), error) {
+func (o *opencodeCfg) Create(ctx context.Context, lg *slog.Logger, permission opencode.PermissionMode) (*opencode.Client, func(), error) {
 	mode := strings.TrimSpace(o.Mode)
 	baseURL := strings.TrimSpace(o.BaseURL)
 	if mode == "" {
@@ -152,7 +165,7 @@ func (o *opencodeCfg) Create(ctx context.Context, lg *slog.Logger) (*opencode.Cl
 
 	switch mode {
 	case "local":
-		client, stop, err := o.createLocal(ctx, baseURL, lg)
+		client, stop, err := o.createLocal(ctx, baseURL, lg, permission)
 		if err != nil {
 			return nil, clean, err
 		}
@@ -192,8 +205,8 @@ func (o *opencodeCfg) apiLogger(lg *slog.Logger) *slog.Logger {
 	return lg.With("component", "opencode-api")
 }
 
-func (o *opencodeCfg) createLocal(ctx context.Context, defaultBaseURL string, lg *slog.Logger) (_ *opencode.Client, _ func(), rerr error) {
-	baseURL, cleanup, err := o.startLocal(ctx, defaultBaseURL, lg)
+func (o *opencodeCfg) createLocal(ctx context.Context, defaultBaseURL string, lg *slog.Logger, permission opencode.PermissionMode) (_ *opencode.Client, _ func(), rerr error) {
+	baseURL, cleanup, err := o.startLocal(ctx, defaultBaseURL, lg, permission)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -220,10 +233,10 @@ func (o *opencodeCfg) createLocal(ctx context.Context, defaultBaseURL string, lg
 	return client, cleanup, nil
 }
 
-func (o *opencodeCfg) startLocal(ctx context.Context, defaultBaseURL string, lg *slog.Logger) (baseURL string, stop func(), _ error) {
+func (o *opencodeCfg) startLocal(ctx context.Context, defaultBaseURL string, lg *slog.Logger, permission opencode.PermissionMode) (baseURL string, stop func(), _ error) {
 	baseURL = defaultBaseURL
 	argv := append([]string{"serve"}, o.Args...)
-	env := append([]string(nil), o.Env...)
+	env := o.localEnvironment(permission)
 
 	if baseURL == defaultLocalOpencodeURL {
 		// Find a free port. There is a small TOCTOU window between Close and
@@ -281,4 +294,12 @@ func (o *opencodeCfg) startLocal(ctx context.Context, defaultBaseURL string, lg 
 	}
 
 	return baseURL, stop, nil
+}
+
+func (o *opencodeCfg) localEnvironment(permission opencode.PermissionMode) []string {
+	env := append([]string(nil), o.Env...)
+	if value := permission.OpenCodePermissionJSON(); value != "" {
+		env = append(env, "OPENCODE_PERMISSION="+value)
+	}
+	return env
 }

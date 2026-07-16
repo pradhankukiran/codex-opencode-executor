@@ -217,6 +217,7 @@ func TestClient_CreateSession(t *testing.T) {
 		ProviderID: "xai",
 		ModelID:    "grok-4.5",
 		Agent:      "build",
+		Permission: PermissionModeYOLO,
 	})
 	require.NoError(t, err)
 	require.Equal(t, "ses-new", sess.ID)
@@ -230,6 +231,34 @@ func TestClient_CreateSession(t *testing.T) {
 	agent, ok := body.Agent.Get()
 	require.True(t, ok)
 	require.Equal(t, "build", agent)
+	require.Equal(t, opencodeapi.PermissionRuleset{
+		{
+			Permission: "*",
+			Pattern:    "*",
+			Action:     opencodeapi.PermissionActionAllow,
+		},
+	}, body.Permission)
+}
+
+func TestClient_CreateSessionInheritsPermissions(t *testing.T) {
+	t.Parallel()
+
+	requests := make(chan opencodeapi.SessionCreateReq, 1)
+	handler := &HandlerMock{
+		SessionCreateFunc: func(ctx context.Context, req opencodeapi.OptSessionCreateReq, params opencodeapi.SessionCreateParams) (opencodeapi.SessionCreateRes, error) {
+			body, _ := req.Get()
+			requests <- body
+			return &opencodeapi.Session{ID: "ses-new"}, nil
+		},
+	}
+	client := setupTestServer(t, handler)
+
+	_, err := client.CreateSession(t.Context(), Location{}, CreateSessionRequest{
+		Title:      "Inherited permissions",
+		Permission: PermissionModeInherit,
+	})
+	require.NoError(t, err)
+	require.Empty(t, (<-requests).Permission)
 }
 
 func TestClient_Prompt(t *testing.T) {

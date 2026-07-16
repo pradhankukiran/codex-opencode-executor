@@ -36,12 +36,17 @@ func (m ModelRef) String() string {
 
 // ExecutorOptions controls defaults used when MCP calls omit execution choices.
 type ExecutorOptions struct {
-	DefaultModel ModelRef
-	DefaultAgent string
+	DefaultModel      ModelRef
+	DefaultAgent      string
+	DefaultPermission PermissionMode
 }
 
 func (o ExecutorOptions) sessionRequest(args createSessionParams) (CreateSessionRequest, error) {
 	model, err := o.modelFor(args.Model, args.ProviderID, args.ModelID)
+	if err != nil {
+		return CreateSessionRequest{}, err
+	}
+	permission, err := o.permissionFor(args.PermissionMode)
 	if err != nil {
 		return CreateSessionRequest{}, err
 	}
@@ -57,7 +62,18 @@ func (o ExecutorOptions) sessionRequest(args createSessionParams) (CreateSession
 		ProviderID: model.ProviderID,
 		ModelID:    model.ModelID,
 		Agent:      agent,
+		Permission: permission,
 	}, nil
+}
+
+func (o ExecutorOptions) permissionFor(value string) (PermissionMode, error) {
+	if strings.TrimSpace(value) == "" {
+		if o.DefaultPermission == "" {
+			return PermissionModeInherit, nil
+		}
+		return o.DefaultPermission, nil
+	}
+	return ParsePermissionMode(value)
 }
 
 func (o ExecutorOptions) promptRequest(args fireParams) PromptRequest {

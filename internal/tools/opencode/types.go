@@ -78,11 +78,12 @@ type SessionsRequest struct {
 }
 
 type CreateSessionRequest struct {
-	Title      string `json:"title,omitempty"`
-	ParentID   string `json:"parentID,omitempty"`
-	ProviderID string `json:"providerID,omitempty"`
-	ModelID    string `json:"modelID,omitempty"`
-	Agent      string `json:"agent,omitempty"`
+	Title      string         `json:"title,omitempty"`
+	ParentID   string         `json:"parentID,omitempty"`
+	ProviderID string         `json:"providerID,omitempty"`
+	ModelID    string         `json:"modelID,omitempty"`
+	Agent      string         `json:"agent,omitempty"`
+	Permission PermissionMode `json:"-"`
 }
 
 type PromptRequest struct {
@@ -95,10 +96,11 @@ type PromptPayload struct {
 }
 
 type CreateSessionResult struct {
-	SessionID string `json:"session_id"`
-	Title     string `json:"title,omitempty"`
-	Model     string `json:"model,omitempty"`
-	Agent     string `json:"agent,omitempty"`
+	SessionID      string `json:"session_id"`
+	Title          string `json:"title,omitempty"`
+	Model          string `json:"model,omitempty"`
+	Agent          string `json:"agent,omitempty"`
+	PermissionMode string `json:"permission_mode,omitempty"`
 }
 
 type HandoffFireResult struct {

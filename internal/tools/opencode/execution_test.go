@@ -44,8 +44,9 @@ func TestExecutorOptionsSessionRequest(t *testing.T) {
 	t.Parallel()
 
 	opts := ExecutorOptions{
-		DefaultModel: ModelRef{ProviderID: "xai", ModelID: "grok-4.5"},
-		DefaultAgent: "build",
+		DefaultModel:      ModelRef{ProviderID: "xai", ModelID: "grok-4.5"},
+		DefaultAgent:      "build",
+		DefaultPermission: PermissionModeYOLO,
 	}
 
 	t.Run("defaults", func(t *testing.T) {
@@ -54,6 +55,7 @@ func TestExecutorOptionsSessionRequest(t *testing.T) {
 		require.Equal(t, "xai", req.ProviderID)
 		require.Equal(t, "grok-4.5", req.ModelID)
 		require.Equal(t, "build", req.Agent)
+		require.Equal(t, PermissionModeYOLO, req.Permission)
 	})
 
 	t.Run("model and agent overrides", func(t *testing.T) {
@@ -75,6 +77,12 @@ func TestExecutorOptionsSessionRequest(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, "openai", req.ProviderID)
 		require.Equal(t, "gpt-5", req.ModelID)
+	})
+
+	t.Run("permission override", func(t *testing.T) {
+		req, err := opts.sessionRequest(createSessionParams{PermissionMode: "deny"})
+		require.NoError(t, err)
+		require.Equal(t, PermissionModeDeny, req.Permission)
 	})
 
 	t.Run("rejects mixed model inputs", func(t *testing.T) {

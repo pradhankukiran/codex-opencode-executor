@@ -43,7 +43,7 @@ func Register(s *mcp.Server, client *Client, mgr *Manager, opts ExecutorOptions)
 
 	mcputil.Register(s, mcputil.ToolDef{
 		Name:        "handoff_create_session",
-		Description: "Create a new opencode session and return its session_id. The configured default model and agent are used unless overridden. Use the returned session_id with handoff_fire to submit prompts.",
+		Description: "Create a new opencode session and return its session_id. The configured default model, agent, and permission mode are used unless overridden. Use the returned session_id with handoff_fire to submit prompts.",
 	}, createSessionHandler(client, opts))
 
 	mcputil.Register(s, mcputil.ToolDef{
@@ -184,12 +184,13 @@ func sessionsHandler(client *Client) mcp.ToolHandlerFor[SessionsRequest, Session
 
 type createSessionParams struct {
 	locationParams
-	Title      string `json:"title,omitempty" jsonschema:"Optional session title."`
-	ParentID   string `json:"parent_id,omitempty" jsonschema:"Optional parent session ID."`
-	Model      string `json:"model,omitempty" jsonschema:"Optional model in provider/model form (e.g. 'xai/grok-4.5'). Overrides the configured default. Model is fixed for the lifetime of the session."`
-	ProviderID string `json:"provider_id,omitempty" jsonschema:"Optional model provider id for compatibility. Must be used with model_id and cannot be combined with model."`
-	ModelID    string `json:"model_id,omitempty" jsonschema:"Optional model id for compatibility. Must be used with provider_id and cannot be combined with model. Model is fixed for the lifetime of the session."`
-	Agent      string `json:"agent,omitempty" jsonschema:"Optional opencode agent name. Overrides the configured default agent."`
+	Title          string `json:"title,omitempty" jsonschema:"Optional session title."`
+	ParentID       string `json:"parent_id,omitempty" jsonschema:"Optional parent session ID."`
+	Model          string `json:"model,omitempty" jsonschema:"Optional model in provider/model form (e.g. 'xai/grok-4.5'). Overrides the configured default. Model is fixed for the lifetime of the session."`
+	ProviderID     string `json:"provider_id,omitempty" jsonschema:"Optional model provider id for compatibility. Must be used with model_id and cannot be combined with model."`
+	ModelID        string `json:"model_id,omitempty" jsonschema:"Optional model id for compatibility. Must be used with provider_id and cannot be combined with model. Model is fixed for the lifetime of the session."`
+	Agent          string `json:"agent,omitempty" jsonschema:"Optional opencode agent name. Overrides the configured default agent."`
+	PermissionMode string `json:"permission_mode,omitempty" jsonschema:"Optional permission mode: inherit, ask, deny, or yolo. Overrides the configured default for this session."`
 }
 
 func createSessionHandler(client *Client, opts ExecutorOptions) mcp.ToolHandlerFor[createSessionParams, CreateSessionResult] {
@@ -204,10 +205,11 @@ func createSessionHandler(client *Client, opts ExecutorOptions) mcp.ToolHandlerF
 		}
 		model := ModelRef{ProviderID: req.ProviderID, ModelID: req.ModelID}
 		return nil, CreateSessionResult{
-			SessionID: session.ID,
-			Title:     session.Title,
-			Model:     model.String(),
-			Agent:     req.Agent,
+			SessionID:      session.ID,
+			Title:          session.Title,
+			Model:          model.String(),
+			Agent:          req.Agent,
+			PermissionMode: string(req.Permission),
 		}, nil
 	}
 }
