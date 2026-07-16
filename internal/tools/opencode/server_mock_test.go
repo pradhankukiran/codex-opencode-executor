@@ -7,7 +7,7 @@ import (
 	"context"
 	"sync"
 
-	"github.com/go-faster/gooners/internal/tools/opencode/opencodeapi"
+	"github.com/pradhankukiran/codex-opencode-executor/internal/tools/opencode/opencodeapi"
 )
 
 // Ensure, that HandlerMock does implement opencodeapi.Handler.

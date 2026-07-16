@@ -1,4 +1,4 @@
-// Package main is the entrypoint for the opencode-handoff-mcp MCP server.
+// Package main is the entrypoint for the codex-opencode-executor MCP server.
 package main
 
 import (
@@ -18,8 +18,8 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/go-faster/gooners/internal/mcputil"
-	"github.com/go-faster/gooners/internal/tools/opencode"
+	"github.com/pradhankukiran/codex-opencode-executor/internal/mcputil"
+	"github.com/pradhankukiran/codex-opencode-executor/internal/tools/opencode"
 )
 
 const defaultLocalOpencodeURL = "http://localhost:4096"
@@ -55,8 +55,8 @@ func main() {
 	defer closeClient()
 
 	s := mcputil.NewServer(mcputil.ServerConfig{
-		Name:         "opencode-handoff-mcp",
-		Instructions: "You are connected to opencode-handoff-mcp. Use these tools to delegate coding tasks to opencode agents, monitor their sessions, and answer permission or clarification requests when needed.",
+		Name:         "codex-opencode-executor",
+		Instructions: "You are connected to codex-opencode-executor. Use these tools to delegate coding tasks to opencode agents, monitor their sessions, and answer permission or clarification requests when needed.",
 		Logger:       logger.With("component", "mcp-sdk"),
 	})
 	mgr := opencode.NewManager(ctx, client, opencode.ManagerOptions{
@@ -77,7 +77,7 @@ func envDefault(name, fallback string) string {
 
 func defaultStateDir() string {
 	if dir, err := os.UserCacheDir(); err == nil {
-		return filepath.Join(dir, "opencode-handoff-mcp", "jobs")
+		return filepath.Join(dir, "codex-opencode-executor", "jobs")
 	}
 	return ""
 }
@@ -103,7 +103,7 @@ func (o *opencodeCfg) Register(_ *flag.FlagSet) {
 	flag.StringVar(&o.DefaultDirectory, "default-directory", os.Getenv("OPENCODE_DIRECTORY"), "default x-opencode-directory value (env: OPENCODE_DIRECTORY)")
 	flag.DurationVar(&o.RequestTimeout, "request-timeout", 30*time.Second, "timeout for regular opencode HTTP calls")
 	flag.DurationVar(&o.SyncTimeout, "sync-timeout", 5*time.Minute, "timeout for blocking prompt calls (session message POST) used by handoff_run and handoff_fire")
-	flag.StringVar(&o.StateDir, "state-dir", envDefault("OPENCODE_HANDOFF_STATE_DIR", defaultStateDir()), "directory for persisting job state across restarts (env: OPENCODE_HANDOFF_STATE_DIR)")
+	flag.StringVar(&o.StateDir, "state-dir", envDefault("CODEX_OPENCODE_EXECUTOR_STATE_DIR", defaultStateDir()), "directory for persisting job state across restarts (env: CODEX_OPENCODE_EXECUTOR_STATE_DIR)")
 	flag.BoolVar(&o.LogAPI, "log-api", false, "log opencode HTTP request/response bodies at debug level (requires -log-level debug or -log-file)")
 	flag.StringVar(&o.BaseURL, "opencode-url", os.Getenv("OPENCODE_URL"), "opencode server base URL (env: OPENCODE_URL); defaults to localhost on random port in local mode")
 	flag.StringVar(&o.Username, "opencode-username", envDefault("OPENCODE_USERNAME", "opencode"), "opencode basic auth username (env: OPENCODE_USERNAME)")
@@ -218,8 +218,8 @@ func (o *opencodeCfg) startLocal(ctx context.Context, defaultBaseURL string, lg 
 
 		baseURL = fmt.Sprintf("http://127.0.0.1:%d", port)
 
-		argv = append(argv, "--port", strconv.Itoa(port), "--mdns-domain", fmt.Sprintf("opencode-handoff-%d.local", port))
-		env = append(env, fmt.Sprintf("OPENCODE_MCP_INSTANCE=opencode-handoff-%d", port))
+		argv = append(argv, "--port", strconv.Itoa(port), "--mdns-domain", fmt.Sprintf("codex-opencode-executor-%d.local", port))
+		env = append(env, fmt.Sprintf("OPENCODE_MCP_INSTANCE=codex-opencode-executor-%d", port))
 	}
 
 	cmd := exec.CommandContext(ctx, "opencode", argv...) //nolint:gosec // Operator-controlled local opencode invocation.

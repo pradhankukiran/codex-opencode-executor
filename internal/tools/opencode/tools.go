@@ -12,7 +12,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/go-faster/gooners/internal/tools/mcputil"
+	"github.com/pradhankukiran/codex-opencode-executor/internal/tools/mcputil"
 )
 
 // Register adds opencode handoff tools to an MCP server.

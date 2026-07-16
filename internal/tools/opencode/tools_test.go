@@ -15,7 +15,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/require"
 
-	opencodeapi "github.com/go-faster/gooners/internal/tools/opencode/opencodeapi"
+	opencodeapi "github.com/pradhankukiran/codex-opencode-executor/internal/tools/opencode/opencodeapi"
 )
 
 func TestManagerJobsReturnsSnapshots(t *testing.T) {

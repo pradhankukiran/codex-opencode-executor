@@ -18,7 +18,7 @@ import (
 
 	"github.com/go-faster/jx"
 
-	api "github.com/go-faster/gooners/internal/tools/opencode/opencodeapi"
+	api "github.com/pradhankukiran/codex-opencode-executor/internal/tools/opencode/opencodeapi"
 )
 
 const defaultBaseURL = "http://localhost:4096"

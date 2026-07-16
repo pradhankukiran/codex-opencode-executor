@@ -1,4 +1,4 @@
-module github.com/go-faster/gooners
+module github.com/pradhankukiran/codex-opencode-executor
 
 go 1.26.3
 

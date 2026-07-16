@@ -9,7 +9,7 @@ import (
 	"github.com/go-faster/jx"
 	"github.com/stretchr/testify/require"
 
-	"github.com/go-faster/gooners/internal/tools/opencode/opencodeapi"
+	"github.com/pradhankukiran/codex-opencode-executor/internal/tools/opencode/opencodeapi"
 )
 
 //go:embed _testdata

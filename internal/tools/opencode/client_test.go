@@ -12,7 +12,7 @@ import (
 	"github.com/go-faster/jx"
 	"github.com/stretchr/testify/require"
 
-	opencodeapi "github.com/go-faster/gooners/internal/tools/opencode/opencodeapi"
+	opencodeapi "github.com/pradhankukiran/codex-opencode-executor/internal/tools/opencode/opencodeapi"
 )
 
 func newTestClient(t *testing.T, cfg Config) *Client {
