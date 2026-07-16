@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"slices"
 	"strings"
 	"time"
@@ -26,6 +27,8 @@ const defaultBaseURL = "http://localhost:4096"
 // Client calls opencode HTTP API endpoints via the generated client.
 type Client struct {
 	apiClient        *api.Client
+	syncAPIClient    *api.Client
+	httpClient       *http.Client
 	syncTimeout      time.Duration
 	baseURL          string
 	defaultDirectory string
@@ -62,9 +65,16 @@ func NewClient(cfg Config, timeout time.Duration) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create API client: %w", err)
 	}
+	syncHTTPClient := newHTTPClient(0)
+	syncAPIClient, err := api.NewClient(baseURL, api.WithClient(syncHTTPClient))
+	if err != nil {
+		return nil, fmt.Errorf("create sync API client: %w", err)
+	}
 
 	return &Client{
 		apiClient:        apiClient,
+		syncAPIClient:    syncAPIClient,
+		httpClient:       httpClient,
 		syncTimeout:      syncTimeout,
 		baseURL:          strings.TrimRight(baseURL, "/"),
 		defaultDirectory: cfg.DefaultDirectory,
@@ -344,6 +354,11 @@ func (c *Client) Prompt(ctx context.Context, loc Location, sessionID string, req
 	if sessionID == "" {
 		return nil, fmt.Errorf("session_id is required")
 	}
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline && c.syncTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.syncTimeout)
+		defer cancel()
+	}
 
 	textPart := api.SessionMessageReqPartsItem{}
 	textPart.SetType("text")
@@ -363,7 +378,7 @@ func (c *Client) Prompt(ctx context.Context, loc Location, sessionID string, req
 		params.Directory = api.NewOptString(dir)
 	}
 
-	res, err := c.apiClient.SessionMessage(ctx, &body, params)
+	res, err := c.syncAPIClient.SessionMessage(ctx, &body, params)
 	if err != nil {
 		return nil, err
 	}
@@ -385,6 +400,56 @@ func (c *Client) Prompt(ctx context.Context, loc Location, sessionID string, req
 	default:
 		return nil, fmt.Errorf("unexpected session message response: %T", res)
 	}
+}
+
+// Abort stops active execution for an opencode session.
+func (c *Client) Abort(ctx context.Context, loc Location, sessionID string) (bool, error) {
+	if sessionID == "" {
+		return false, fmt.Errorf("session_id is required")
+	}
+
+	u, err := url.Parse(c.baseURL)
+	if err != nil {
+		return false, fmt.Errorf("parse opencode base URL: %w", err)
+	}
+	u.Path = strings.TrimRight(u.Path, "/") + "/session/" + url.PathEscape(sessionID) + "/abort"
+	query := u.Query()
+	if dir := c.dir(loc); dir != "" {
+		query.Set("directory", dir)
+	}
+	if loc.Workspace != "" {
+		query.Set("workspace", loc.Workspace)
+	}
+	u.RawQuery = query.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), nil)
+	if err != nil {
+		return false, fmt.Errorf("create abort request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+
+	res, err := c.httpClient.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("POST /session/%s/abort: %w", sessionID, err)
+	}
+	defer res.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+	if err != nil {
+		return false, fmt.Errorf("read abort response: %w", err)
+	}
+	if res.StatusCode < http.StatusOK || res.StatusCode >= http.StatusMultipleChoices {
+		return false, fmt.Errorf("POST /session/%s/abort: status %s: %s", sessionID, res.Status, strings.TrimSpace(string(body)))
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		return true, nil
+	}
+
+	var aborted bool
+	if err := json.Unmarshal(body, &aborted); err != nil {
+		return false, fmt.Errorf("decode abort response: %w", err)
+	}
+	return aborted, nil
 }
 
 // Messages returns the raw message array for a session using the v1

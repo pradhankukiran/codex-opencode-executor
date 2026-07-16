@@ -40,6 +40,94 @@ func TestClientTimeout(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestClientPromptUsesSyncTimeout(t *testing.T) {
+	t.Parallel()
+
+	requestStarted := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(requestStarted)
+		time.Sleep(100 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	t.Cleanup(server.Close)
+
+	client, err := NewClient(Config{
+		BaseURL:     server.URL,
+		SyncTimeout: 10 * time.Millisecond,
+	}, time.Second)
+	require.NoError(t, err)
+
+	_, err = client.Prompt(t.Context(), Location{}, "ses-timeout", PromptRequest{
+		Prompt: PromptPayload{Text: "wait"},
+	})
+	require.Error(t, err)
+	select {
+	case <-requestStarted:
+	case <-time.After(time.Second):
+		t.Fatal("prompt request was not sent")
+	}
+}
+
+func TestClientAbort(t *testing.T) {
+	t.Parallel()
+
+	type abortRequest struct {
+		Method    string
+		Path      string
+		Directory string
+		Workspace string
+		Username  string
+		Password  string
+		HasAuth   bool
+	}
+	requests := make(chan abortRequest, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		username, password, ok := r.BasicAuth()
+		requests <- abortRequest{
+			Method:    r.Method,
+			Path:      r.URL.Path,
+			Directory: r.URL.Query().Get("directory"),
+			Workspace: r.URL.Query().Get("workspace"),
+			Username:  username,
+			Password:  password,
+			HasAuth:   ok,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`true`))
+	}))
+	t.Cleanup(server.Close)
+
+	client := newTestClient(t, Config{
+		BaseURL:  server.URL,
+		Username: "user",
+		Password: "pass",
+	})
+	aborted, err := client.Abort(t.Context(), Location{
+		Directory: "/workspace/project",
+		Workspace: "workspace-1",
+	}, "ses-1")
+	require.NoError(t, err)
+	require.True(t, aborted)
+
+	got := <-requests
+	require.Equal(t, http.MethodPost, got.Method)
+	require.Equal(t, "/session/ses-1/abort", got.Path)
+	require.Equal(t, "/workspace/project", got.Directory)
+	require.Equal(t, "workspace-1", got.Workspace)
+	require.True(t, got.HasAuth)
+	require.Equal(t, "user", got.Username)
+	require.Equal(t, "pass", got.Password)
+}
+
+func TestClientAbortValidation(t *testing.T) {
+	t.Parallel()
+
+	client := newTestClient(t, Config{BaseURL: "http://127.0.0.1:1"})
+	_, err := client.Abort(t.Context(), Location{}, "")
+	require.EqualError(t, err, "session_id is required")
+}
+
 func setupTestServer(t *testing.T, handler opencodeapi.Handler) (client *Client) {
 	t.Helper()
 
