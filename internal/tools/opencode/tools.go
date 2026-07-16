@@ -16,7 +16,7 @@ import (
 )
 
 // Register adds opencode handoff tools to an MCP server.
-func Register(s *mcp.Server, client *Client, mgr *Manager) {
+func Register(s *mcp.Server, client *Client, mgr *Manager, opts ExecutorOptions) {
 	mcputil.Register(s, mcputil.ToolDef{
 		Name:        "handoff_health",
 		Description: "Check connectivity to the configured opencode HTTP server. Call this if other handoff tools return connection or authentication errors.",
@@ -43,13 +43,13 @@ func Register(s *mcp.Server, client *Client, mgr *Manager) {
 
 	mcputil.Register(s, mcputil.ToolDef{
 		Name:        "handoff_create_session",
-		Description: "Create a new opencode session and return its session_id. Use the returned session_id with handoff_fire to submit prompts.",
-	}, createSessionHandler(client))
+		Description: "Create a new opencode session and return its session_id. The configured default model and agent are used unless overridden. Use the returned session_id with handoff_fire to submit prompts.",
+	}, createSessionHandler(client, opts))
 
 	mcputil.Register(s, mcputil.ToolDef{
 		Name:        "handoff_fire",
-		Description: "Submit a prompt to an existing opencode session and return immediately. Requires a session_id from handoff_create_session. Use handoff_check with the session_id to poll progress.",
-	}, fireHandler(client, mgr))
+		Description: "Submit a prompt to an existing opencode session and return immediately. The configured default agent is used unless overridden. Requires a session_id from handoff_create_session. Use handoff_check with the session_id to poll progress.",
+	}, fireHandler(client, mgr, opts))
 
 	mcputil.Register(s, mcputil.ToolDef{
 		Name:        "handoff_check",
@@ -186,22 +186,29 @@ type createSessionParams struct {
 	locationParams
 	Title      string `json:"title,omitempty" jsonschema:"Optional session title."`
 	ParentID   string `json:"parent_id,omitempty" jsonschema:"Optional parent session ID."`
-	ProviderID string `json:"provider_id,omitempty" jsonschema:"Optional model provider id (e.g. 'anthropic')."`
-	ModelID    string `json:"model_id,omitempty" jsonschema:"Optional model id (e.g. 'claude-sonnet-4-5'). Model is fixed for the lifetime of the session."`
+	Model      string `json:"model,omitempty" jsonschema:"Optional model in provider/model form (e.g. 'xai/grok-4.5'). Overrides the configured default. Model is fixed for the lifetime of the session."`
+	ProviderID string `json:"provider_id,omitempty" jsonschema:"Optional model provider id for compatibility. Must be used with model_id and cannot be combined with model."`
+	ModelID    string `json:"model_id,omitempty" jsonschema:"Optional model id for compatibility. Must be used with provider_id and cannot be combined with model. Model is fixed for the lifetime of the session."`
+	Agent      string `json:"agent,omitempty" jsonschema:"Optional opencode agent name. Overrides the configured default agent."`
 }
 
-func createSessionHandler(client *Client) mcp.ToolHandlerFor[createSessionParams, CreateSessionResult] {
+func createSessionHandler(client *Client, opts ExecutorOptions) mcp.ToolHandlerFor[createSessionParams, CreateSessionResult] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, args createSessionParams) (*mcp.CallToolResult, CreateSessionResult, error) {
-		session, err := client.CreateSession(ctx, args.location(), CreateSessionRequest{
-			Title:      args.Title,
-			ParentID:   args.ParentID,
-			ProviderID: args.ProviderID,
-			ModelID:    args.ModelID,
-		})
+		req, err := opts.sessionRequest(args)
 		if err != nil {
 			return nil, CreateSessionResult{}, err
 		}
-		return nil, CreateSessionResult{SessionID: session.ID, Title: session.Title}, nil
+		session, err := client.CreateSession(ctx, args.location(), req)
+		if err != nil {
+			return nil, CreateSessionResult{}, err
+		}
+		model := ModelRef{ProviderID: req.ProviderID, ModelID: req.ModelID}
+		return nil, CreateSessionResult{
+			SessionID: session.ID,
+			Title:     session.Title,
+			Model:     model.String(),
+			Agent:     req.Agent,
+		}, nil
 	}
 }
 
@@ -214,7 +221,7 @@ type fireParams struct {
 	WaitSeconds int    `json:"wait_seconds,omitempty" jsonschema:"Max seconds to wait for completion (0-300). 0 = fire and return immediately."`
 }
 
-func fireHandler(client *Client, mgr *Manager) mcp.ToolHandlerFor[fireParams, HandoffFireResult] {
+func fireHandler(client *Client, mgr *Manager, opts ExecutorOptions) mcp.ToolHandlerFor[fireParams, HandoffFireResult] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, args fireParams) (*mcp.CallToolResult, HandoffFireResult, error) {
 		if args.SessionID == "" {
 			return nil, HandoffFireResult{}, fmt.Errorf("session_id is required; use handoff_create_session first")
@@ -223,7 +230,7 @@ func fireHandler(client *Client, mgr *Manager) mcp.ToolHandlerFor[fireParams, Ha
 			return nil, HandoffFireResult{}, fmt.Errorf("prompt is required")
 		}
 
-		sessionID, err := mgr.Submit(ctx, args.location(), args.SessionID, promptRequest(args))
+		sessionID, err := mgr.Submit(ctx, args.location(), args.SessionID, opts.promptRequest(args))
 		if err != nil {
 			return nil, HandoffFireResult{}, err
 		}
@@ -420,13 +427,6 @@ func questionReplyHandler(client *Client) mcp.ToolHandlerFor[questionReplyParams
 		res.PendingQuestions = pending.Questions
 		res.Errors = pending.Errors
 		return nil, res, nil
-	}
-}
-
-func promptRequest(args fireParams) PromptRequest {
-	return PromptRequest{
-		Prompt: PromptPayload{Text: args.Prompt},
-		Agent:  args.Agent,
 	}
 }
 

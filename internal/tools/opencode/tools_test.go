@@ -105,7 +105,7 @@ func TestRegister(t *testing.T) {
 	mgr := NewManager(t.Context(), client, ManagerOptions{})
 
 	require.NotPanics(t, func() {
-		Register(server, client, mgr)
+		Register(server, client, mgr, ExecutorOptions{})
 	})
 }
 
@@ -286,15 +286,20 @@ func TestToolHandlers(t *testing.T) {
 
 	// 5. createSessionHandler
 	{
-		h := createSessionHandler(client)
+		h := createSessionHandler(client, ExecutorOptions{
+			DefaultModel: ModelRef{ProviderID: "xai", ModelID: "grok-4.5"},
+			DefaultAgent: "build",
+		})
 		_, res, err := h(t.Context(), nil, createSessionParams{Title: "New Session"})
 		require.NoError(t, err)
 		require.Equal(t, "ses-new", res.SessionID)
+		require.Equal(t, "xai/grok-4.5", res.Model)
+		require.Equal(t, "build", res.Agent)
 	}
 
 	// 6. fireHandler
 	{
-		h := fireHandler(client, mgr)
+		h := fireHandler(client, mgr, ExecutorOptions{})
 		_, res, err := h(t.Context(), nil, fireParams{SessionID: "ses-123", Prompt: "hello"})
 		require.NoError(t, err)
 		require.Equal(t, "ses-123", res.SessionID)

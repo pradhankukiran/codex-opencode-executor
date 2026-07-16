@@ -22,7 +22,10 @@ import (
 	"github.com/pradhankukiran/codex-opencode-executor/internal/tools/opencode"
 )
 
-const defaultLocalOpencodeURL = "http://localhost:4096"
+const (
+	defaultLocalOpencodeURL = "http://localhost:4096"
+	defaultExecutorModel    = "xai/grok-4.5"
+)
 
 type repeatFlag []string
 
@@ -44,6 +47,12 @@ func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	slog.SetDefault(logger)
 
+	executorOpts, err := ocode.ExecutorOptions()
+	if err != nil {
+		slog.Error("configure executor defaults", "err", err)
+		os.Exit(1)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -63,7 +72,7 @@ func main() {
 		Logger:   logger.With("component", "opencode-manager"),
 		StateDir: ocode.StateDir,
 	})
-	opencode.Register(s, client, mgr)
+	opencode.Register(s, client, mgr, executorOpts)
 
 	if err := s.Run(ctx, &mcp.StdioTransport{}); err != nil {
 		slog.Error("failed to run server", "err", err)
@@ -89,6 +98,8 @@ type opencodeCfg struct {
 	SyncTimeout      time.Duration
 	StateDir         string
 	LogAPI           bool
+	DefaultModel     string
+	DefaultAgent     string
 
 	BaseURL  string
 	Username string
@@ -104,12 +115,25 @@ func (o *opencodeCfg) Register(_ *flag.FlagSet) {
 	flag.DurationVar(&o.RequestTimeout, "request-timeout", 30*time.Second, "timeout for regular opencode HTTP calls")
 	flag.DurationVar(&o.SyncTimeout, "sync-timeout", 5*time.Minute, "timeout for blocking prompt calls (session message POST) used by handoff_run and handoff_fire")
 	flag.StringVar(&o.StateDir, "state-dir", envDefault("CODEX_OPENCODE_EXECUTOR_STATE_DIR", defaultStateDir()), "directory for persisting job state across restarts (env: CODEX_OPENCODE_EXECUTOR_STATE_DIR)")
+	flag.StringVar(&o.DefaultModel, "default-model", envDefault("CODEX_OPENCODE_EXECUTOR_DEFAULT_MODEL", defaultExecutorModel), "default model for new sessions in provider/model form; pass an empty value to use opencode's default (env: CODEX_OPENCODE_EXECUTOR_DEFAULT_MODEL)")
+	flag.StringVar(&o.DefaultAgent, "default-agent", os.Getenv("CODEX_OPENCODE_EXECUTOR_DEFAULT_AGENT"), "default opencode agent for new sessions and prompts; empty uses opencode's default (env: CODEX_OPENCODE_EXECUTOR_DEFAULT_AGENT)")
 	flag.BoolVar(&o.LogAPI, "log-api", false, "log opencode HTTP request/response bodies at debug level (requires -log-level debug or -log-file)")
 	flag.StringVar(&o.BaseURL, "opencode-url", os.Getenv("OPENCODE_URL"), "opencode server base URL (env: OPENCODE_URL); defaults to localhost on random port in local mode")
 	flag.StringVar(&o.Username, "opencode-username", envDefault("OPENCODE_USERNAME", "opencode"), "opencode basic auth username (env: OPENCODE_USERNAME)")
 	flag.StringVar(&o.Password, "opencode-password", os.Getenv("OPENCODE_PASSWORD"), "opencode basic auth password (env: OPENCODE_PASSWORD)")
 	flag.Var(&o.Env, "opencode-env", "environment variable for local opencode serve, in KEY=VALUE form; may be repeated")
 	flag.Var(&o.Args, "opencode-arg", "argument passed to local opencode serve; may be repeated")
+}
+
+func (o *opencodeCfg) ExecutorOptions() (opencode.ExecutorOptions, error) {
+	model, err := opencode.ParseModelRef(o.DefaultModel)
+	if err != nil {
+		return opencode.ExecutorOptions{}, fmt.Errorf("parse default model: %w", err)
+	}
+	return opencode.ExecutorOptions{
+		DefaultModel: model,
+		DefaultAgent: strings.TrimSpace(o.DefaultAgent),
+	}, nil
 }
 
 func (o *opencodeCfg) Create(ctx context.Context, lg *slog.Logger) (*opencode.Client, func(), error) {

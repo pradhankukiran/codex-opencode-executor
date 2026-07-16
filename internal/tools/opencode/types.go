@@ -82,6 +82,7 @@ type CreateSessionRequest struct {
 	ParentID   string `json:"parentID,omitempty"`
 	ProviderID string `json:"providerID,omitempty"`
 	ModelID    string `json:"modelID,omitempty"`
+	Agent      string `json:"agent,omitempty"`
 }
 
 type PromptRequest struct {
@@ -96,6 +97,8 @@ type PromptPayload struct {
 type CreateSessionResult struct {
 	SessionID string `json:"session_id"`
 	Title     string `json:"title,omitempty"`
+	Model     string `json:"model,omitempty"`
+	Agent     string `json:"agent,omitempty"`
 }
 
 type HandoffFireResult struct {

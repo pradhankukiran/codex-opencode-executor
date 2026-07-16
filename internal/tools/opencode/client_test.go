@@ -199,8 +199,11 @@ func TestClient_Sessions(t *testing.T) {
 func TestClient_CreateSession(t *testing.T) {
 	t.Parallel()
 
+	requests := make(chan opencodeapi.SessionCreateReq, 1)
 	handler := &HandlerMock{
 		SessionCreateFunc: func(ctx context.Context, req opencodeapi.OptSessionCreateReq, params opencodeapi.SessionCreateParams) (opencodeapi.SessionCreateRes, error) {
+			body, _ := req.Get()
+			requests <- body
 			s := opencodeapi.Session{
 				ID:    "ses-new",
 				Title: "New Session",
@@ -209,10 +212,24 @@ func TestClient_CreateSession(t *testing.T) {
 		},
 	}
 	client := setupTestServer(t, handler)
-	sess, err := client.CreateSession(t.Context(), Location{}, CreateSessionRequest{Title: "New Session"})
+	sess, err := client.CreateSession(t.Context(), Location{}, CreateSessionRequest{
+		Title:      "New Session",
+		ProviderID: "xai",
+		ModelID:    "grok-4.5",
+		Agent:      "build",
+	})
 	require.NoError(t, err)
 	require.Equal(t, "ses-new", sess.ID)
 	require.Equal(t, "New Session", sess.Title)
+
+	body := <-requests
+	model, ok := body.Model.Get()
+	require.True(t, ok)
+	require.Equal(t, "xai", model.ProviderID)
+	require.Equal(t, "grok-4.5", model.ID)
+	agent, ok := body.Agent.Get()
+	require.True(t, ok)
+	require.Equal(t, "build", agent)
 }
 
 func TestClient_Prompt(t *testing.T) {

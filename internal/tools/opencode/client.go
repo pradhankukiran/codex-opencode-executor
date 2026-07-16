@@ -295,6 +295,9 @@ func (c *Client) CreateSession(ctx context.Context, loc Location, req CreateSess
 	if req.ParentID != "" {
 		body.ParentID.SetTo(req.ParentID)
 	}
+	if req.Agent != "" {
+		body.Agent.SetTo(req.Agent)
+	}
 	if req.ProviderID != "" || req.ModelID != "" {
 		body.Model.SetTo(api.SessionCreateReqModel{
 			ProviderID: req.ProviderID,
