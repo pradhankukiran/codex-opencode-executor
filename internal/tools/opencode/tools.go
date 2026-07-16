@@ -15,6 +15,8 @@ import (
 	"github.com/pradhankukiran/codex-opencode-executor/internal/tools/mcputil"
 )
 
+const maxJobTimeoutSeconds = 24 * 60 * 60
+
 // Register adds opencode handoff tools to an MCP server.
 func Register(s *mcp.Server, client *Client, mgr *Manager, opts ExecutorOptions) {
 	mcputil.Register(s, mcputil.ToolDef{
@@ -56,6 +58,12 @@ func Register(s *mcp.Server, client *Client, mgr *Manager, opts ExecutorOptions)
 		Description: "Poll progress for a session_id returned by handoff_fire, or inspect sessions for pending permissions/questions.",
 		Flags:       mcputil.ReadOnly,
 	}, checkHandler(client, mgr))
+
+	mcputil.Register(s, mcputil.ToolDef{
+		Name:        "handoff_cancel",
+		Description: "Cancel active opencode execution for a session. Cancellation is idempotent for jobs already in a terminal state.",
+		Flags:       mcputil.Destructive,
+	}, cancelHandler(mgr))
 
 	mcputil.Register(s, mcputil.ToolDef{
 		Name:        "handoff_permission_reply",
@@ -216,11 +224,13 @@ func createSessionHandler(client *Client, opts ExecutorOptions) mcp.ToolHandlerF
 
 type fireParams struct {
 	locationParams
-	SessionID   string `json:"session_id" jsonschema:"Session id returned by handoff_create_session."`
-	Prompt      string `json:"prompt" jsonschema:"Task to delegate to opencode."`
-	Agent       string `json:"agent,omitempty" jsonschema:"Optional opencode agent name."`
-	Verbose     bool   `json:"verbose,omitempty" jsonschema:"Include raw messages/context returned by opencode."`
-	WaitSeconds int    `json:"wait_seconds,omitempty" jsonschema:"Max seconds to wait for completion (0-300). 0 = fire and return immediately."`
+	SessionID      string `json:"session_id" jsonschema:"Session id returned by handoff_create_session."`
+	Prompt         string `json:"prompt" jsonschema:"Task to delegate to opencode."`
+	Agent          string `json:"agent,omitempty" jsonschema:"Optional opencode agent name."`
+	Verbose        bool   `json:"verbose,omitempty" jsonschema:"Include raw messages/context returned by opencode."`
+	WaitSeconds    int    `json:"wait_seconds,omitempty" jsonschema:"Max seconds to wait for completion (0-300). 0 = fire and return immediately."`
+	IdempotencyKey string `json:"idempotency_key,omitempty" jsonschema:"Optional retry key scoped to this session. Reusing it with the same request returns the existing job; reusing it with different input is rejected."`
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty" jsonschema:"Execution deadline in seconds. Zero uses the server default. Maximum 86400 seconds."`
 }
 
 func fireHandler(client *Client, mgr *Manager, opts ExecutorOptions) mcp.ToolHandlerFor[fireParams, HandoffFireResult] {
@@ -232,25 +242,43 @@ func fireHandler(client *Client, mgr *Manager, opts ExecutorOptions) mcp.ToolHan
 			return nil, HandoffFireResult{}, fmt.Errorf("prompt is required")
 		}
 
-		sessionID, err := mgr.Submit(ctx, args.location(), args.SessionID, opts.promptRequest(args))
+		submitOpts, err := submitOptions(args)
+		if err != nil {
+			return nil, HandoffFireResult{}, err
+		}
+		submission, err := mgr.SubmitJob(ctx, args.location(), args.SessionID, opts.promptRequest(args), submitOpts)
 		if err != nil {
 			return nil, HandoffFireResult{}, err
 		}
 
-		res := HandoffFireResult{SessionID: sessionID}
+		job := submission.Job
+		res := HandoffFireResult{
+			SessionID:       job.SessionID,
+			Status:          string(job.Status),
+			IdempotencyKey:  job.IdempotencyKey,
+			Duplicate:       submission.Duplicate,
+			Deadline:        formatDeadline(job.Deadline),
+			PromptMessageID: job.PromptMessageID,
+		}
 
 		if args.WaitSeconds > 0 {
 			waitCtx, cancel := context.WithTimeout(ctx, time.Duration(min(args.WaitSeconds, 300))*time.Second)
 			defer cancel()
-			_ = client.Wait(waitCtx, args.location(), sessionID)
+			_ = client.Wait(waitCtx, args.location(), job.SessionID)
+			if current, ok := mgr.Job(job.SessionID); ok {
+				res.Status = string(current.Status)
+				res.PromptMessageID = current.PromptMessageID
+			}
 		}
 
-		pending := fetchPending(ctx, client, args.location(), sessionID)
+		pending := fetchPending(ctx, client, args.location(), job.SessionID)
 		res.PendingPermissions = pending.Permissions
 		res.PendingQuestions = pending.Questions
 		res.Errors = pending.Errors
 
-		if len(res.PendingPermissions) > 0 || len(res.PendingQuestions) > 0 {
+		if submission.Duplicate {
+			res.Message = fmt.Sprintf("duplicate submission; returning existing job with status %s", job.Status)
+		} else if len(res.PendingPermissions) > 0 || len(res.PendingQuestions) > 0 {
 			res.Message = "prompt submitted; pending action; use handoff_check,handoff_permission_reply,handoff_question_reply"
 		} else {
 			res.Message = "prompt submitted; use handoff_check with this session_id to monitor progress"
@@ -258,6 +286,19 @@ func fireHandler(client *Client, mgr *Manager, opts ExecutorOptions) mcp.ToolHan
 
 		return nil, res, nil
 	}
+}
+
+func submitOptions(args fireParams) (SubmitOptions, error) {
+	if args.TimeoutSeconds < 0 {
+		return SubmitOptions{}, fmt.Errorf("timeout_seconds must not be negative")
+	}
+	if args.TimeoutSeconds > maxJobTimeoutSeconds {
+		return SubmitOptions{}, fmt.Errorf("timeout_seconds must not exceed %d", maxJobTimeoutSeconds)
+	}
+	return SubmitOptions{
+		IdempotencyKey: args.IdempotencyKey,
+		Timeout:        time.Duration(args.TimeoutSeconds) * time.Second,
+	}, nil
 }
 
 type checkParams struct {
@@ -282,7 +323,7 @@ func checkHandler(client *Client, mgr *Manager) mcp.ToolHandlerFor[checkParams, 
 
 func doCheck(ctx context.Context, client *Client, mgr *Manager, args checkParams) (HandoffCheckResult, error) {
 	loc := args.location()
-	job, ok := mgr.Job(args.SessionID)
+	_, tracked := mgr.Job(args.SessionID)
 
 	res, isFinished, err := checkSession(ctx, client, loc, args.SessionID, args.Verbose)
 	if err != nil {
@@ -291,29 +332,52 @@ func doCheck(ctx context.Context, client *Client, mgr *Manager, args checkParams
 
 	// No tracked job (external session or different server instance): report
 	// whatever opencode says and surface any pending permissions/questions.
-	if !ok {
+	if !tracked {
 		res.Status = sessionStatus(isFinished)
 		return res, nil
 	}
 
-	if job.Status == JobRunning || job.Status == JobUnknown {
-		res.Status = sessionStatus(isFinished)
-		return res, nil
-	}
-
-	// A job may be in error state because the HTTP POST timed out, yet the
-	// opencode session may have continued. Trust the message stream over the
-	// job error when the session is demonstrably finished.
-	if isFinished {
-		res.Status = string(JobDone)
-		return res, nil
-	}
-
+	job, _ := mgr.Reconcile(args.SessionID, isFinished)
 	res.Status = string(job.Status)
+	res.IdempotencyKey = job.IdempotencyKey
+	res.Deadline = formatDeadline(job.Deadline)
 	if job.Err != nil {
 		res.JobError = job.Err.Error()
 	}
 	return res, nil
+}
+
+type cancelParams struct {
+	locationParams
+	SessionID string `json:"session_id" jsonschema:"opencode session id to cancel."`
+}
+
+func cancelHandler(mgr *Manager) mcp.ToolHandlerFor[cancelParams, HandoffCancelResult] {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, args cancelParams) (*mcp.CallToolResult, HandoffCancelResult, error) {
+		result, err := mgr.Cancel(ctx, args.location(), args.SessionID)
+		if err != nil {
+			return nil, HandoffCancelResult{}, err
+		}
+		message := "session execution was already in a terminal state"
+		if result.Aborted {
+			message = "session execution canceled"
+		} else if result.Job.Status == JobCanceled {
+			message = "opencode reported no active execution; session is marked canceled"
+		}
+		return nil, HandoffCancelResult{
+			SessionID: result.Job.SessionID,
+			Status:    string(result.Job.Status),
+			Aborted:   result.Aborted,
+			Message:   message,
+		}, nil
+	}
+}
+
+func formatDeadline(deadline time.Time) string {
+	if deadline.IsZero() {
+		return ""
+	}
+	return deadline.UTC().Format(time.RFC3339Nano)
 }
 
 // sessionStatus maps the isFinished flag to a status string for sessions that

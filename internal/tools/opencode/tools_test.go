@@ -139,6 +139,24 @@ func TestClientValidationErrors(t *testing.T) {
 	require.EqualError(t, err, "session_id is required")
 }
 
+func TestSubmitOptions(t *testing.T) {
+	t.Parallel()
+
+	opts, err := submitOptions(fireParams{
+		IdempotencyKey: "request-1",
+		TimeoutSeconds: 90,
+	})
+	require.NoError(t, err)
+	require.Equal(t, "request-1", opts.IdempotencyKey)
+	require.Equal(t, 90*time.Second, opts.Timeout)
+
+	_, err = submitOptions(fireParams{TimeoutSeconds: -1})
+	require.EqualError(t, err, "timeout_seconds must not be negative")
+
+	_, err = submitOptions(fireParams{TimeoutSeconds: maxJobTimeoutSeconds + 1})
+	require.EqualError(t, err, "timeout_seconds must not exceed 86400")
+}
+
 func TestToolHandlers(t *testing.T) {
 	t.Parallel()
 
@@ -302,9 +320,22 @@ func TestToolHandlers(t *testing.T) {
 	// 6. fireHandler
 	{
 		h := fireHandler(client, mgr, ExecutorOptions{})
-		_, res, err := h(t.Context(), nil, fireParams{SessionID: "ses-123", Prompt: "hello"})
+		args := fireParams{
+			SessionID:      "ses-123",
+			Prompt:         "hello",
+			IdempotencyKey: "request-1",
+			TimeoutSeconds: 60,
+		}
+		_, res, err := h(t.Context(), nil, args)
 		require.NoError(t, err)
 		require.Equal(t, "ses-123", res.SessionID)
+		require.Equal(t, "request-1", res.IdempotencyKey)
+		require.NotEmpty(t, res.Deadline)
+
+		_, duplicate, err := h(t.Context(), nil, args)
+		require.NoError(t, err)
+		require.True(t, duplicate.Duplicate)
+		require.Contains(t, duplicate.Message, "duplicate submission")
 	}
 
 	// 7. permissionReplyHandler
@@ -329,5 +360,20 @@ func TestToolHandlers(t *testing.T) {
 		_, res, err := h(t.Context(), nil, checkParams{SessionID: "ses-123"})
 		require.NoError(t, err)
 		require.Equal(t, "ses-123", res.SessionID)
+	}
+
+	// 10. cancelHandler
+	{
+		cancelMgr := NewManager(t.Context(), &fakeJobClient{
+			abort: func(context.Context, Location, string) (bool, error) {
+				return true, nil
+			},
+		}, ManagerOptions{})
+		h := cancelHandler(cancelMgr)
+		_, res, err := h(t.Context(), nil, cancelParams{SessionID: "ses-external"})
+		require.NoError(t, err)
+		require.Equal(t, "ses-external", res.SessionID)
+		require.Equal(t, string(JobCanceled), res.Status)
+		require.True(t, res.Aborted)
 	}
 }

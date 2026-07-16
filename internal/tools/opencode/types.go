@@ -105,6 +105,10 @@ type CreateSessionResult struct {
 
 type HandoffFireResult struct {
 	SessionID          string           `json:"session_id"`
+	Status             string           `json:"status,omitempty"`
+	IdempotencyKey     string           `json:"idempotency_key,omitempty"`
+	Duplicate          bool             `json:"duplicate,omitempty"`
+	Deadline           string           `json:"deadline,omitempty"`
 	PromptMessageID    string           `json:"prompt_message_id,omitempty"`
 	Message            string           `json:"message,omitempty"`
 	PendingPermissions []RequestSummary `json:"pending_permissions,omitempty"`
@@ -115,12 +119,21 @@ type HandoffFireResult struct {
 type HandoffCheckResult struct {
 	SessionID          string           `json:"session_id"`
 	Status             string           `json:"status,omitempty"`
+	IdempotencyKey     string           `json:"idempotency_key,omitempty"`
+	Deadline           string           `json:"deadline,omitempty"`
 	FinalText          string           `json:"final_text,omitempty"`
 	PendingPermissions []RequestSummary `json:"pending_permissions,omitempty"`
 	PendingQuestions   []RequestSummary `json:"pending_questions,omitempty"`
 	JobError           string           `json:"job_error,omitempty"`
 	Errors             []string         `json:"errors,omitempty"`
 	Messages           []MessageSummary `json:"messages,omitempty"`
+}
+
+type HandoffCancelResult struct {
+	SessionID string `json:"session_id"`
+	Status    string `json:"status"`
+	Aborted   bool   `json:"aborted"`
+	Message   string `json:"message,omitempty"`
 }
 
 type MessageSummary struct {
