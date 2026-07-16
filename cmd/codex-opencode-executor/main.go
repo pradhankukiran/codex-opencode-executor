@@ -70,8 +70,9 @@ func main() {
 		Logger:       logger.With("component", "mcp-sdk"),
 	})
 	mgr := opencode.NewManager(ctx, client, opencode.ManagerOptions{
-		Logger:   logger.With("component", "opencode-manager"),
-		StateDir: ocode.StateDir,
+		Logger:         logger.With("component", "opencode-manager"),
+		StateDir:       ocode.StateDir,
+		DefaultTimeout: ocode.SyncTimeout,
 	})
 	opencode.Register(s, client, mgr, executorOpts)
 
