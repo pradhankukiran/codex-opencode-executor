@@ -12,6 +12,9 @@ type ModelRef struct {
 }
 
 // ParseModelRef parses a model in provider/model form.
+// Only the first slash separates provider_id from model id; nested slashes in
+// the model id (e.g. vercel/xai/grok-4.5 → provider vercel, id xai/grok-4.5)
+// are preserved.
 func ParseModelRef(value string) (ModelRef, error) {
 	value = strings.TrimSpace(value)
 	if value == "" {
@@ -27,11 +30,25 @@ func ParseModelRef(value string) (ModelRef, error) {
 	return ModelRef{ProviderID: providerID, ModelID: modelID}, nil
 }
 
+// String returns the canonical model selector provider_id/model_id accepted by
+// handoff_create_session.model. Empty when either side is missing (no fabricated
+// malformed selectors). Nested slashes in ModelID are preserved.
 func (m ModelRef) String() string {
 	if m.ProviderID == "" || m.ModelID == "" {
 		return ""
 	}
 	return m.ProviderID + "/" + m.ModelID
+}
+
+// newModelSummary builds a catalogue entry with canonical_model derived from
+// ModelRef so every adapter path stays consistent.
+func newModelSummary(providerID, id, name string) ModelSummary {
+	return ModelSummary{
+		ProviderID:     providerID,
+		ID:             id,
+		Name:           name,
+		CanonicalModel: ModelRef{ProviderID: providerID, ModelID: id}.String(),
+	}
 }
 
 // ExecutorOptions controls defaults used when MCP calls omit execution choices.

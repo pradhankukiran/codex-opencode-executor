@@ -38,7 +38,7 @@ func Register(s *mcp.Server, client *Client, mgr *Manager, workspaces *workspace
 
 	mcputil.Register(s, mcputil.ToolDef{
 		Name:        "handoff_models",
-		Description: "List opencode providers and optionally models. Supports substring, glob (e.g. 'openai/gpt-*-mini'), or regex filtering and a result limit to avoid cluttering context with large provider catalogs (e.g. OpenRouter). When filter is set, the response includes only providers represented by the final returned models (after filtering and limit).",
+		Description: "List opencode providers and optionally models. Each model includes canonical_model (provider_id + '/' + complete model id, preserving embedded slashes), which can be passed directly to handoff_create_session.model. Gateway and direct routes are distinct exact selectors (e.g. vercel/xai/grok-4.5 vs xai/grok-4.5). Supports substring, glob (e.g. 'openai/gpt-*-mini'), or regex filtering and a result limit to avoid cluttering context with large provider catalogs (e.g. OpenRouter). When filter is set, the response includes only providers represented by the final returned models (after filtering and limit).",
 		Flags:       mcputil.ReadOnly,
 	}, modelsHandler(client))
 

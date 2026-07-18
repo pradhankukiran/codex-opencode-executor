@@ -57,9 +57,10 @@ type ProviderSummary struct {
 }
 
 type ModelSummary struct {
-	ProviderID string `json:"provider_id,omitempty"`
-	ID         string `json:"id"`
-	Name       string `json:"name,omitempty"`
+	ProviderID     string `json:"provider_id,omitempty"`
+	ID             string `json:"id"`
+	Name           string `json:"name,omitempty"`
+	CanonicalModel string `json:"canonical_model,omitempty" jsonschema:"Exact selector for handoff_create_session.model: provider_id + '/' + complete model id (embedded slashes preserved). Pass directly to handoff_create_session.model."`
 }
 
 type Session struct {

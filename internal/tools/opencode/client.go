@@ -245,11 +245,11 @@ func (c *Client) currentProvidersAndModels(ctx context.Context, loc Location) (M
 		})
 		for modelKey, model := range provider.Models {
 			modelID := cmp.Or(model.ID, modelKey)
-			result.Models = append(result.Models, ModelSummary{
-				ProviderID: provider.ID,
-				ID:         modelID,
-				Name:       cmp.Or(model.Name, modelID),
-			})
+			result.Models = append(result.Models, newModelSummary(
+				provider.ID,
+				modelID,
+				cmp.Or(model.Name, modelID),
+			))
 		}
 	}
 
@@ -342,11 +342,7 @@ func (c *Client) apiProvidersAndModels(ctx context.Context, loc Location) (Model
 
 	var models []ModelSummary
 	for _, m := range modelList.Data {
-		models = append(models, ModelSummary{
-			ProviderID: m.ProviderID,
-			ID:         m.ID,
-			Name:       m.Name,
-		})
+		models = append(models, newModelSummary(m.ProviderID, m.ID, m.Name))
 	}
 
 	return sortModelsResult(ModelsResult{Providers: providers, Models: models}), true, nil

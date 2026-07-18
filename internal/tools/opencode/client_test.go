@@ -299,6 +299,8 @@ func TestClient_ProvidersAndModels(t *testing.T) {
 	require.Len(t, res.Models, 1)
 	require.Equal(t, "claude-3-5-sonnet", res.Models[0].ID)
 	require.Equal(t, "anthropic", res.Models[0].ProviderID)
+	require.Equal(t, "anthropic/claude-3-5-sonnet", res.Models[0].CanonicalModel)
+	requireCanonicalModelRoundTrip(t, res.Models)
 }
 
 func TestClient_ProvidersAndModelsCurrentAPI(t *testing.T) {
@@ -338,7 +340,86 @@ func TestClient_ProvidersAndModelsCurrentAPI(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []string{"/provider"}, paths)
 	require.Equal(t, []ProviderSummary{{ID: "xai", Name: "xAI", Models: 1}}, res.Providers)
-	require.Equal(t, []ModelSummary{{ProviderID: "xai", ID: "grok-4.5", Name: "Grok 4.5"}}, res.Models)
+	require.Equal(t, []ModelSummary{{
+		ProviderID: "xai", ID: "grok-4.5", Name: "Grok 4.5", CanonicalModel: "xai/grok-4.5",
+	}}, res.Models)
+	requireCanonicalModelRoundTrip(t, res.Models)
+}
+
+func TestClient_ProvidersAndModelsCurrentAPINestedSlash(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/provider":
+			_, _ = w.Write([]byte(`{
+				"all": [
+					{
+						"id": "vercel",
+						"name": "Vercel",
+						"models": {
+							"xai/grok-4.5": {"id": "xai/grok-4.5", "name": "Grok 4.5"}
+						}
+					},
+					{
+						"id": "xai",
+						"name": "xAI",
+						"models": {
+							"grok-4.5": {"id": "grok-4.5", "name": "Grok 4.5"}
+						}
+					}
+				],
+				"connected": ["vercel", "xai"],
+				"default": {}
+			}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	client := newTestClient(t, Config{BaseURL: server.URL})
+	res, err := client.ProvidersAndModels(t.Context(), Location{})
+	require.NoError(t, err)
+	require.Equal(t, []ModelSummary{
+		{ProviderID: "vercel", ID: "xai/grok-4.5", Name: "Grok 4.5", CanonicalModel: "vercel/xai/grok-4.5"},
+		{ProviderID: "xai", ID: "grok-4.5", Name: "Grok 4.5", CanonicalModel: "xai/grok-4.5"},
+	}, res.Models)
+	requireCanonicalModelRoundTrip(t, res.Models)
+}
+
+func TestClient_ProvidersAndModelsV2NestedSlash(t *testing.T) {
+	t.Parallel()
+
+	handler := &HandlerMock{
+		V2ProviderListFunc: func(context.Context, opencodeapi.V2ProviderListParams) (opencodeapi.V2ProviderListRes, error) {
+			return &opencodeapi.V2ProviderListOK{
+				Data: []opencodeapi.ProviderV2Info{
+					{ID: "vercel", Name: "Vercel", API: jx.Raw(`{}`), Enabled: jx.Raw(`true`)},
+					{ID: "xai", Name: "xAI", API: jx.Raw(`{}`), Enabled: jx.Raw(`true`)},
+				},
+			}, nil
+		},
+		V2ModelListFunc: func(context.Context, opencodeapi.V2ModelListParams) (opencodeapi.V2ModelListRes, error) {
+			return &opencodeapi.V2ModelListOK{
+				Data: []opencodeapi.ModelV2Info{
+					modelV2("vercel", "xai/grok-4.5", "Grok 4.5"),
+					modelV2("xai", "grok-4.5", "Grok 4.5"),
+				},
+			}, nil
+		},
+	}
+	client := setupTestServer(t, handler)
+	// Force V2 path by making GET /provider unavailable via the mock server.
+	// setupTestServer serves V2 only; current GET /provider returns 404 → V2 fallback.
+	res, err := client.ProvidersAndModels(t.Context(), Location{})
+	require.NoError(t, err)
+	require.Equal(t, []ModelSummary{
+		{ProviderID: "vercel", ID: "xai/grok-4.5", Name: "Grok 4.5", CanonicalModel: "vercel/xai/grok-4.5"},
+		{ProviderID: "xai", ID: "grok-4.5", Name: "Grok 4.5", CanonicalModel: "xai/grok-4.5"},
+	}, res.Models)
+	requireCanonicalModelRoundTrip(t, res.Models)
 }
 
 func TestClient_Sessions(t *testing.T) {

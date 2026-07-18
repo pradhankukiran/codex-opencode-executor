@@ -365,9 +365,10 @@ func TestModelsHandlerFilteredProviders(t *testing.T) {
 		_, res, err := h(t.Context(), nil, modelsParams{Filter: "xai/grok-4.5", Limit: 10})
 		require.NoError(t, err)
 		require.Equal(t, []ModelSummary{
-			{ProviderID: "vercel", ID: "xai/grok-4.5", Name: "Grok 4.5"},
-			{ProviderID: "xai", ID: "grok-4.5", Name: "Grok 4.5"},
+			{ProviderID: "vercel", ID: "xai/grok-4.5", Name: "Grok 4.5", CanonicalModel: "vercel/xai/grok-4.5"},
+			{ProviderID: "xai", ID: "grok-4.5", Name: "Grok 4.5", CanonicalModel: "xai/grok-4.5"},
 		}, res.Models)
+		requireCanonicalModelRoundTrip(t, res.Models)
 		require.Equal(t, []ProviderSummary{
 			{ID: "vercel", Name: "Vercel", Models: 1},
 			{ID: "xai", Name: "xAI", Models: 1},
@@ -385,8 +386,9 @@ func TestModelsHandlerFilteredProviders(t *testing.T) {
 		_, res, err := h(t.Context(), nil, modelsParams{Filter: "xai/grok-4.5", Limit: 1})
 		require.NoError(t, err)
 		require.Equal(t, []ModelSummary{
-			{ProviderID: "vercel", ID: "xai/grok-4.5", Name: "Grok 4.5"},
+			{ProviderID: "vercel", ID: "xai/grok-4.5", Name: "Grok 4.5", CanonicalModel: "vercel/xai/grok-4.5"},
 		}, res.Models)
+		requireCanonicalModelRoundTrip(t, res.Models)
 		require.Equal(t, []ProviderSummary{
 			{ID: "vercel", Name: "Vercel", Models: 1},
 		}, res.Providers)
@@ -396,12 +398,25 @@ func TestModelsHandlerFilteredProviders(t *testing.T) {
 		_, res, err := h(t.Context(), nil, modelsParams{IncludeModels: true, Limit: 2})
 		require.NoError(t, err)
 		require.Len(t, res.Models, 2)
+		requireCanonicalModelRoundTrip(t, res.Models)
 		require.Equal(t, []ProviderSummary{
 			{ID: "anthropic", Name: "Anthropic", Models: 1},
 			{ID: "openai", Name: "OpenAI", Models: 2},
 			{ID: "vercel", Name: "Vercel", Models: 1},
 			{ID: "xai", Name: "xAI", Models: 2},
 		}, res.Providers)
+	})
+
+	t.Run("unfiltered include_models without limit returns distinct gateway and direct selectors", func(t *testing.T) {
+		_, res, err := h(t.Context(), nil, modelsParams{IncludeModels: true, Limit: -1})
+		require.NoError(t, err)
+		require.Contains(t, res.Models, ModelSummary{
+			ProviderID: "vercel", ID: "xai/grok-4.5", Name: "Grok 4.5", CanonicalModel: "vercel/xai/grok-4.5",
+		})
+		require.Contains(t, res.Models, ModelSummary{
+			ProviderID: "xai", ID: "grok-4.5", Name: "Grok 4.5", CanonicalModel: "xai/grok-4.5",
+		})
+		requireCanonicalModelRoundTrip(t, res.Models)
 	})
 
 	t.Run("unfiltered provider-only omits models and keeps all providers", func(t *testing.T) {
@@ -433,6 +448,52 @@ func modelV2(providerID, id, name string) opencodeapi.ModelV2Info {
 		Time: opencodeapi.ModelV2InfoTime{
 			Released: jx.Raw(`"2026-06-15"`),
 		},
+	}
+}
+
+// requireCanonicalModelRoundTrip checks each non-empty canonical_model parses
+// back to the original provider_id and complete model id via ParseModelRef.
+func requireCanonicalModelRoundTrip(t *testing.T, models []ModelSummary) {
+	t.Helper()
+	for _, m := range models {
+		require.NotEmpty(t, m.CanonicalModel, "canonical_model missing for provider_id=%q id=%q", m.ProviderID, m.ID)
+		ref, err := ParseModelRef(m.CanonicalModel)
+		require.NoError(t, err, "canonical_model %q", m.CanonicalModel)
+		require.Equal(t, m.ProviderID, ref.ProviderID, "canonical_model %q", m.CanonicalModel)
+		require.Equal(t, m.ID, ref.ModelID, "canonical_model %q", m.CanonicalModel)
+		require.Equal(t, m.CanonicalModel, ref.String())
+	}
+}
+
+func TestNewModelSummaryCanonicalModel(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		providerID string
+		id         string
+		want       string
+	}{
+		{name: "direct route", providerID: "xai", id: "grok-4.5", want: "xai/grok-4.5"},
+		{name: "gateway nested slash", providerID: "vercel", id: "xai/grok-4.5", want: "vercel/xai/grok-4.5"},
+		{name: "openrouter nested", providerID: "openrouter", id: "anthropic/claude-sonnet-4", want: "openrouter/anthropic/claude-sonnet-4"},
+		{name: "empty provider", providerID: "", id: "grok-4.5", want: ""},
+		{name: "empty id", providerID: "xai", id: "", want: ""},
+		{name: "both empty", providerID: "", id: "", want: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := newModelSummary(tt.providerID, tt.id, "name")
+			require.Equal(t, tt.providerID, got.ProviderID)
+			require.Equal(t, tt.id, got.ID)
+			require.Equal(t, "name", got.Name)
+			require.Equal(t, tt.want, got.CanonicalModel)
+			if tt.want != "" {
+				requireCanonicalModelRoundTrip(t, []ModelSummary{got})
+			}
+		})
 	}
 }
 
