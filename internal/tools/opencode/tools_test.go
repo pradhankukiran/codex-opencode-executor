@@ -329,6 +329,113 @@ func TestSubmitOptions(t *testing.T) {
 	require.EqualError(t, err, "timeout_seconds must not exceed 86400")
 }
 
+func TestModelsHandlerFilteredProviders(t *testing.T) {
+	t.Parallel()
+
+	handler := &HandlerMock{
+		V2ProviderListFunc: func(context.Context, opencodeapi.V2ProviderListParams) (opencodeapi.V2ProviderListRes, error) {
+			return &opencodeapi.V2ProviderListOK{
+				Data: []opencodeapi.ProviderV2Info{
+					{ID: "anthropic", Name: "Anthropic", API: jx.Raw(`{}`), Enabled: jx.Raw(`true`)},
+					{ID: "openai", Name: "OpenAI", API: jx.Raw(`{}`), Enabled: jx.Raw(`true`)},
+					{ID: "vercel", Name: "Vercel", API: jx.Raw(`{}`), Enabled: jx.Raw(`true`)},
+					{ID: "xai", Name: "xAI", API: jx.Raw(`{}`), Enabled: jx.Raw(`true`)},
+				},
+			}, nil
+		},
+		V2ModelListFunc: func(context.Context, opencodeapi.V2ModelListParams) (opencodeapi.V2ModelListRes, error) {
+			return &opencodeapi.V2ModelListOK{
+				Data: []opencodeapi.ModelV2Info{
+					modelV2("anthropic", "claude-3-5-sonnet", "Claude 3.5 Sonnet"),
+					modelV2("openai", "gpt-4o", "GPT-4o"),
+					modelV2("openai", "gpt-4o-mini", "GPT-4o Mini"),
+					// Live catalogue shape: gateway model IDs may embed a provider prefix.
+					modelV2("vercel", "xai/grok-4.5", "Grok 4.5"),
+					modelV2("xai", "grok-4.5", "Grok 4.5"),
+					modelV2("xai", "grok-3", "Grok 3"),
+				},
+			}, nil
+		},
+	}
+	client := setupTestServer(t, handler)
+	h := modelsHandler(client)
+
+	t.Run("filter keeps only providers represented by matched models", func(t *testing.T) {
+		// Live repro: filter="xai/grok-4.5" matches vercel id "xai/grok-4.5" and xai id "grok-4.5".
+		_, res, err := h(t.Context(), nil, modelsParams{Filter: "xai/grok-4.5", Limit: 10})
+		require.NoError(t, err)
+		require.Equal(t, []ModelSummary{
+			{ProviderID: "vercel", ID: "xai/grok-4.5", Name: "Grok 4.5"},
+			{ProviderID: "xai", ID: "grok-4.5", Name: "Grok 4.5"},
+		}, res.Models)
+		require.Equal(t, []ProviderSummary{
+			{ID: "vercel", Name: "Vercel", Models: 1},
+			{ID: "xai", Name: "xAI", Models: 1},
+		}, res.Providers)
+	})
+
+	t.Run("filter with no matches returns empty models and providers", func(t *testing.T) {
+		_, res, err := h(t.Context(), nil, modelsParams{Filter: "does-not-exist", Limit: 10})
+		require.NoError(t, err)
+		require.Empty(t, res.Models)
+		require.Empty(t, res.Providers)
+	})
+
+	t.Run("limit truncates models then drops unrepresented providers", func(t *testing.T) {
+		_, res, err := h(t.Context(), nil, modelsParams{Filter: "xai/grok-4.5", Limit: 1})
+		require.NoError(t, err)
+		require.Equal(t, []ModelSummary{
+			{ProviderID: "vercel", ID: "xai/grok-4.5", Name: "Grok 4.5"},
+		}, res.Models)
+		require.Equal(t, []ProviderSummary{
+			{ID: "vercel", Name: "Vercel", Models: 1},
+		}, res.Providers)
+	})
+
+	t.Run("unfiltered include_models keeps all providers and limits models", func(t *testing.T) {
+		_, res, err := h(t.Context(), nil, modelsParams{IncludeModels: true, Limit: 2})
+		require.NoError(t, err)
+		require.Len(t, res.Models, 2)
+		require.Equal(t, []ProviderSummary{
+			{ID: "anthropic", Name: "Anthropic", Models: 1},
+			{ID: "openai", Name: "OpenAI", Models: 2},
+			{ID: "vercel", Name: "Vercel", Models: 1},
+			{ID: "xai", Name: "xAI", Models: 2},
+		}, res.Providers)
+	})
+
+	t.Run("unfiltered provider-only omits models and keeps all providers", func(t *testing.T) {
+		_, res, err := h(t.Context(), nil, modelsParams{})
+		require.NoError(t, err)
+		require.Empty(t, res.Models)
+		require.Equal(t, []ProviderSummary{
+			{ID: "anthropic", Name: "Anthropic", Models: 1},
+			{ID: "openai", Name: "OpenAI", Models: 2},
+			{ID: "vercel", Name: "Vercel", Models: 1},
+			{ID: "xai", Name: "xAI", Models: 2},
+		}, res.Providers)
+	})
+}
+
+func modelV2(providerID, id, name string) opencodeapi.ModelV2Info {
+	return opencodeapi.ModelV2Info{
+		ProviderID: providerID,
+		ID:         id,
+		Name:       name,
+		API:        jx.Raw(`{}`),
+		Capabilities: opencodeapi.ModelV2InfoCapabilities{
+			Input:  []string{},
+			Output: []string{},
+		},
+		Cost:     []opencodeapi.ModelV2InfoCostItem{},
+		Status:   opencodeapi.ModelV2InfoStatusActive,
+		Variants: []opencodeapi.ModelV2InfoVariantsItem{},
+		Time: opencodeapi.ModelV2InfoTime{
+			Released: jx.Raw(`"2026-06-15"`),
+		},
+	}
+}
+
 func TestToolHandlers(t *testing.T) {
 	t.Parallel()
 

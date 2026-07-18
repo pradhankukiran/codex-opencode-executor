@@ -38,7 +38,7 @@ func Register(s *mcp.Server, client *Client, mgr *Manager, workspaces *workspace
 
 	mcputil.Register(s, mcputil.ToolDef{
 		Name:        "handoff_models",
-		Description: "List opencode providers and optionally models. Supports substring, glob (e.g. 'openai/gpt-*-mini'), or regex filtering and a result limit to avoid cluttering context with large provider catalogs (e.g. OpenRouter).",
+		Description: "List opencode providers and optionally models. Supports substring, glob (e.g. 'openai/gpt-*-mini'), or regex filtering and a result limit to avoid cluttering context with large provider catalogs (e.g. OpenRouter). When filter is set, the response includes only providers represented by the final returned models (after filtering and limit).",
 		Flags:       mcputil.ReadOnly,
 	}, modelsHandler(client))
 
@@ -144,8 +144,8 @@ func agentsHandler(client *Client) mcp.ToolHandlerFor[locationParams, AgentsResu
 type modelsParams struct {
 	locationParams
 	IncludeModels bool   `json:"include_models,omitempty" jsonschema:"If true, includes the list of individual models. Defaults to false."`
-	Filter        string `json:"filter,omitempty" jsonschema:"Optional substring, glob, or regex to filter models (e.g., 'xai/', 'openai/gpt-*-mini'). Implies include_models=true."`
-	Limit         int    `json:"limit,omitempty" jsonschema:"Maximum number of models to return when include_models is true. Defaults to 50; pass -1 for no limit. Zero is treated as the default."`
+	Filter        string `json:"filter,omitempty" jsonschema:"Optional substring, glob, or regex to filter models (e.g., 'xai/', 'openai/gpt-*-mini'). Implies include_models=true. When set, providers are limited to those represented by the final returned models."`
+	Limit         int    `json:"limit,omitempty" jsonschema:"Maximum number of models to return when include_models is true. Defaults to 50; pass -1 for no limit. Zero is treated as the default. With filter set, providers are trimmed to those still represented after this limit."`
 }
 
 func modelsHandler(client *Client) mcp.ToolHandlerFor[modelsParams, ModelsResult] {
@@ -154,34 +154,60 @@ func modelsHandler(client *Client) mcp.ToolHandlerFor[modelsParams, ModelsResult
 		if err != nil {
 			return nil, ModelsResult{}, err
 		}
-
-		includeModels := args.IncludeModels || args.Filter != ""
-		if !includeModels {
-			res.Models = nil
-			return nil, res, nil
-		}
-
-		if args.Filter != "" {
-			var filtered []ModelSummary
-			for _, m := range res.Models {
-				if matchModel(args.Filter, m) {
-					filtered = append(filtered, m)
-				}
-			}
-			res.Models = filtered
-		}
-
-		limit := 50
-		if args.Limit != 0 {
-			limit = args.Limit
-		}
-
-		if limit > 0 && len(res.Models) > limit {
-			res.Models = res.Models[:limit]
-		}
-
-		return nil, res, nil
+		return nil, shapeModelsResult(res, args), nil
 	}
+}
+
+// shapeModelsResult applies include/filter/limit and, when filter is set,
+// retains only provider summaries referenced by the final model list.
+func shapeModelsResult(res ModelsResult, args modelsParams) ModelsResult {
+	includeModels := args.IncludeModels || args.Filter != ""
+	if !includeModels {
+		res.Models = nil
+		return res
+	}
+
+	if args.Filter != "" {
+		var filtered []ModelSummary
+		for _, m := range res.Models {
+			if matchModel(args.Filter, m) {
+				filtered = append(filtered, m)
+			}
+		}
+		res.Models = filtered
+	}
+
+	limit := 50
+	if args.Limit != 0 {
+		limit = args.Limit
+	}
+
+	if limit > 0 && len(res.Models) > limit {
+		res.Models = res.Models[:limit]
+	}
+
+	if args.Filter != "" {
+		res.Providers = providersRepresentedByModels(res.Providers, res.Models)
+	}
+
+	return res
+}
+
+func providersRepresentedByModels(providers []ProviderSummary, models []ModelSummary) []ProviderSummary {
+	counts := make(map[string]int, len(models))
+	for _, m := range models {
+		counts[m.ProviderID]++
+	}
+	out := make([]ProviderSummary, 0, len(counts))
+	for _, p := range providers {
+		n, ok := counts[p.ID]
+		if !ok {
+			continue
+		}
+		p.Models = n
+		out = append(out, p)
+	}
+	return out
 }
 
 // matchModel reports whether m matches filter using substring, then glob
