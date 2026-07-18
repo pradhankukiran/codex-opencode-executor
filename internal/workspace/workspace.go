@@ -20,8 +20,10 @@ import (
 )
 
 const (
-	defaultOutputLimit = 20_000
-	maxSessionIDLength = 256
+	defaultOutputLimit     = 20_000
+	maxSessionIDLength     = 256
+	maxVerificationChecks  = 20
+	maxVerificationHistory = 100
 )
 
 type Mode string
@@ -91,13 +93,16 @@ type Commit struct {
 
 type Report struct {
 	Record
-	Available    bool          `json:"available"`
-	HeadCommit   string        `json:"head_commit,omitempty"`
-	Dirty        bool          `json:"dirty,omitempty"`
-	HasChanges   bool          `json:"has_changes,omitempty"`
-	ChangedFiles []ChangedFile `json:"changed_files,omitempty"`
-	Commits      []Commit      `json:"commits,omitempty"`
-	DiffStat     string        `json:"diff_stat,omitempty"`
+	Available         bool          `json:"available"`
+	HeadCommit        string        `json:"head_commit,omitempty"`
+	Dirty             bool          `json:"dirty,omitempty"`
+	HasChanges        bool          `json:"has_changes,omitempty"`
+	ChangedFiles      []ChangedFile `json:"changed_files,omitempty"`
+	Commits           []Commit      `json:"commits,omitempty"`
+	DiffStat          string        `json:"diff_stat,omitempty"`
+	ChangedFileCount  int           `json:"changed_file_count,omitempty"`
+	CommitCount       int           `json:"commit_count,omitempty"`
+	VerificationCount int           `json:"verification_count,omitempty"`
 }
 
 type Diff struct {
@@ -235,7 +240,7 @@ func (m *Manager) Inspect(ctx context.Context, sessionID string) (Report, bool, 
 	if !ok {
 		return Report{}, false, nil
 	}
-	report := Report{Record: record}
+	report := Report{Record: record, VerificationCount: len(record.Verification)}
 	if !record.CleanedAt.IsZero() || record.RepositoryRoot == "" || record.Directory == "" {
 		return report, true, nil
 	}
@@ -257,6 +262,7 @@ func (m *Manager) Inspect(ctx context.Context, sessionID string) (Report, bool, 
 		return Report{}, true, err
 	}
 	report.ChangedFiles = parseStatus(status)
+	report.ChangedFileCount = len(report.ChangedFiles)
 	report.Dirty = len(report.ChangedFiles) > 0
 
 	if record.BaseCommit != "" {
@@ -265,6 +271,7 @@ func (m *Manager) Inspect(ctx context.Context, sessionID string) (Report, bool, 
 			return Report{}, true, err
 		}
 		report.Commits = parseCommits(logOutput)
+		report.CommitCount = len(report.Commits)
 		stat, err := gitOutput(ctx, record.Directory, "diff", "--stat", "--no-ext-diff", record.BaseCommit)
 		if err != nil {
 			return Report{}, true, err
@@ -323,6 +330,9 @@ func (m *Manager) Verify(ctx context.Context, sessionID string, checks []Verific
 	if len(checks) == 0 {
 		return nil, errors.New("at least one verification check is required")
 	}
+	if len(checks) > maxVerificationChecks {
+		return nil, fmt.Errorf("verification is limited to %d checks per call", maxVerificationChecks)
+	}
 
 	results := make([]VerificationResult, 0, len(checks))
 	for _, check := range checks {
@@ -335,6 +345,9 @@ func (m *Manager) Verify(ctx context.Context, sessionID string, checks []Verific
 		m.mu.Lock()
 		current := m.records[sessionID]
 		current.Verification = append(current.Verification, result)
+		if len(current.Verification) > maxVerificationHistory {
+			current.Verification = append([]VerificationResult(nil), current.Verification[len(current.Verification)-maxVerificationHistory:]...)
+		}
 		m.records[sessionID] = current
 		m.mu.Unlock()
 		if err := m.save(current); err != nil {

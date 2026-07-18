@@ -42,6 +42,7 @@ func TestManagerWorktreeLifecycle(t *testing.T) {
 	require.True(t, report.Available)
 	require.True(t, report.Dirty)
 	require.True(t, report.HasChanges)
+	require.Equal(t, 2, report.ChangedFileCount)
 	require.ElementsMatch(t, []ChangedFile{
 		{Status: " M", Path: "tracked.txt"},
 		{Status: "??", Path: "new.txt"},
@@ -67,6 +68,10 @@ func TestManagerWorktreeLifecycle(t *testing.T) {
 	persisted, ok := reloaded.Lookup("session-1")
 	require.True(t, ok)
 	require.Len(t, persisted.Verification, 2)
+	persistedReport, ok, err := reloaded.Inspect(t.Context(), "session-1")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, 2, persistedReport.VerificationCount)
 
 	_, err = reloaded.Cleanup(t.Context(), "session-1", false)
 	require.EqualError(t, err, "workspace has uncommitted changes or commits; pass force=true to discard them")
@@ -96,6 +101,7 @@ func TestManagerTracksCommits(t *testing.T) {
 	require.False(t, report.Dirty)
 	require.True(t, report.HasChanges)
 	require.Len(t, report.Commits, 1)
+	require.Equal(t, 1, report.CommitCount)
 	require.Equal(t, "executor change", report.Commits[0].Subject)
 	require.NotEqual(t, report.BaseCommit, report.HeadCommit)
 }
