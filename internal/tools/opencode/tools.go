@@ -50,7 +50,7 @@ func Register(s *mcp.Server, client *Client, mgr *Manager, workspaces *workspace
 
 	mcputil.Register(s, mcputil.ToolDef{
 		Name:        "handoff_create_session",
-		Description: "Create a new opencode session and return its session_id. Configured model, agent, permission, and workspace-isolation defaults are used unless overridden. Auto isolation uses a worktree for clean Git projects and runs directly otherwise. Use the returned session_id with handoff_fire.",
+		Description: "Create a new opencode session and return its session_id. Configured model, agent, permission, and workspace-isolation defaults are used unless overridden. Auto isolation uses a worktree for clean Git projects and runs directly otherwise. Set create_directory=true with an explicit directory to create a missing exact target path as an executor-owned greenfield workspace (parent must exist; existing paths are refused). Use the returned session_id with handoff_fire.",
 	}, createSessionHandler(client, workspaces, opts))
 
 	mcputil.Register(s, mcputil.ToolDef{
@@ -72,13 +72,13 @@ func Register(s *mcp.Server, client *Client, mgr *Manager, workspaces *workspace
 
 	mcputil.Register(s, mcputil.ToolDef{
 		Name:        "handoff_workspace",
-		Description: "Inspect the durable workspace bound to an opencode session, including changed files, commits, diff statistics, and recorded verification checks.",
+		Description: "Inspect the durable workspace bound to an opencode session, including changed files, commits, diff statistics, and recorded verification checks. Greenfield workspaces are available before Git init and report the whole project relative to an empty tree after Git history exists.",
 		Flags:       mcputil.ReadOnly,
 	}, workspaceInspectHandler(workspaces))
 
 	mcputil.Register(s, mcputil.ToolDef{
 		Name:        "handoff_diff",
-		Description: "Read a bounded tracked-file Git diff for a session workspace relative to its starting commit. Untracked file names are available from handoff_workspace.",
+		Description: "Read a bounded tracked-file Git diff for a session workspace relative to its starting commit (or the empty tree for greenfield repositories). Untracked file names are available from handoff_workspace.",
 		Flags:       mcputil.ReadOnly,
 	}, workspaceDiffHandler(workspaces))
 
@@ -90,7 +90,7 @@ func Register(s *mcp.Server, client *Client, mgr *Manager, workspaces *workspace
 
 	mcputil.Register(s, mcputil.ToolDef{
 		Name:        "handoff_cleanup",
-		Description: "Remove an executor-owned worktree after execution. Clean worktrees are removed by default; force=true is required to discard changes or commits.",
+		Description: "Remove an executor-owned workspace after execution (Git worktree or greenfield directory). Clean owned workspaces are removed by default; force=true is required to discard files, changes, or commits. Cleanup is idempotent.",
 		Flags:       mcputil.Destructive,
 	}, workspaceCleanupHandler(mgr, workspaces))
 
@@ -228,14 +228,15 @@ func sessionsHandler(client *Client) mcp.ToolHandlerFor[SessionsRequest, Session
 
 type createSessionParams struct {
 	locationParams
-	Title          string `json:"title,omitempty" jsonschema:"Optional session title."`
-	ParentID       string `json:"parent_id,omitempty" jsonschema:"Optional parent session ID."`
-	Model          string `json:"model,omitempty" jsonschema:"Optional model in provider/model form (e.g. 'xai/grok-4.5'). Overrides the configured default. Model is fixed for the lifetime of the session."`
-	ProviderID     string `json:"provider_id,omitempty" jsonschema:"Optional model provider id for compatibility. Must be used with model_id and cannot be combined with model."`
-	ModelID        string `json:"model_id,omitempty" jsonschema:"Optional model id for compatibility. Must be used with provider_id and cannot be combined with model. Model is fixed for the lifetime of the session."`
-	Agent          string `json:"agent,omitempty" jsonschema:"Optional opencode agent name. Overrides the configured default agent."`
-	PermissionMode string `json:"permission_mode,omitempty" jsonschema:"Optional permission mode: inherit, ask, deny, or yolo. Overrides the configured default for this session."`
-	IsolationMode  string `json:"isolation_mode,omitempty" jsonschema:"Optional workspace isolation: auto, worktree, or none. Auto uses a worktree for clean Git projects and runs directly otherwise."`
+	Title           string `json:"title,omitempty" jsonschema:"Optional session title."`
+	ParentID        string `json:"parent_id,omitempty" jsonschema:"Optional parent session ID."`
+	Model           string `json:"model,omitempty" jsonschema:"Optional model in provider/model form (e.g. 'xai/grok-4.5'). Overrides the configured default. Model is fixed for the lifetime of the session."`
+	ProviderID      string `json:"provider_id,omitempty" jsonschema:"Optional model provider id for compatibility. Must be used with model_id and cannot be combined with model."`
+	ModelID         string `json:"model_id,omitempty" jsonschema:"Optional model id for compatibility. Must be used with provider_id and cannot be combined with model. Model is fixed for the lifetime of the session."`
+	Agent           string `json:"agent,omitempty" jsonschema:"Optional opencode agent name. Overrides the configured default agent."`
+	PermissionMode  string `json:"permission_mode,omitempty" jsonschema:"Optional permission mode: inherit, ask, deny, or yolo. Overrides the configured default for this session."`
+	IsolationMode   string `json:"isolation_mode,omitempty" jsonschema:"Optional workspace isolation: auto, worktree, or none. Auto uses a worktree for clean Git projects and runs directly otherwise. Ignored when create_directory creates a greenfield workspace."`
+	CreateDirectory bool   `json:"create_directory,omitempty" jsonschema:"If true, create the exact missing directory as an executor-owned greenfield workspace before opening OpenCode. Requires a non-empty explicit directory whose parent already exists. Fails if the target already exists (including empty dirs or final-component symlinks). Defaults to false; missing directories still fail without this opt-in."`
 }
 
 func createSessionHandler(client *Client, workspaces *workspace.Manager, opts ExecutorOptions) mcp.ToolHandlerFor[createSessionParams, CreateSessionResult] {
@@ -257,7 +258,11 @@ func createSessionHandler(client *Client, workspaces *workspace.Manager, opts Ex
 		if workspaces == nil {
 			session, err = client.CreateSession(ctx, loc, req)
 		} else {
-			created, openErr := workspaces.Open(ctx, loc.Directory, mode, func(ctx context.Context, directory string) (string, error) {
+			created, openErr := workspaces.Open(ctx, workspace.OpenOptions{
+				Directory:       loc.Directory,
+				Mode:            mode,
+				CreateDirectory: args.CreateDirectory,
+			}, func(ctx context.Context, directory string) (string, error) {
 				loc.Directory = directory
 				session, err = client.CreateSession(ctx, loc, req)
 				return session.ID, err

@@ -20,6 +20,44 @@ import (
 	"github.com/pradhankukiran/codex-opencode-executor/internal/workspace"
 )
 
+func TestCreateSessionCreateDirectoryGreenfield(t *testing.T) {
+	parent := t.TempDir()
+	target := filepath.Join(parent, "new-app")
+
+	var createDirectory string
+	handler := &HandlerMock{
+		SessionCreateFunc: func(_ context.Context, _ opencodeapi.OptSessionCreateReq, params opencodeapi.SessionCreateParams) (opencodeapi.SessionCreateRes, error) {
+			createDirectory = params.Directory.Value
+			return &opencodeapi.Session{ID: "session-greenfield", Title: "Greenfield"}, nil
+		},
+	}
+	client := setupTestServer(t, handler)
+	workspaces, err := workspace.NewManager(workspace.Options{
+		StateDir:    filepath.Join(t.TempDir(), "state"),
+		DefaultMode: workspace.ModeAuto,
+	})
+	require.NoError(t, err)
+
+	h := createSessionHandler(client, workspaces, ExecutorOptions{})
+	_, result, err := h(t.Context(), nil, createSessionParams{
+		locationParams:  locationParams{Directory: target},
+		CreateDirectory: true,
+		Title:           "Greenfield",
+	})
+	require.NoError(t, err)
+	require.NotNil(t, result.Workspace)
+	require.Equal(t, workspace.ModeGreenfield, result.Workspace.Mode)
+	require.True(t, result.Workspace.Owned)
+	require.Equal(t, target, result.Workspace.Directory)
+	require.Equal(t, target, createDirectory)
+	require.DirExists(t, target)
+
+	_, _, err = h(t.Context(), nil, createSessionParams{
+		locationParams: locationParams{Directory: filepath.Join(parent, "missing-no-opt-in")},
+	})
+	require.ErrorContains(t, err, "inspect source directory")
+}
+
 func TestCreateSessionBindsIsolatedWorkspace(t *testing.T) {
 	repository := t.TempDir()
 	runGit(t, repository, "init")
@@ -82,7 +120,7 @@ func TestWorkspaceToolHandlers(t *testing.T) {
 		DefaultMode: workspace.ModeAuto,
 	})
 	require.NoError(t, err)
-	record, err := workspaces.Open(t.Context(), repository, "", func(context.Context, string) (string, error) {
+	record, err := workspaces.Open(t.Context(), workspace.OpenOptions{Directory: repository}, func(context.Context, string) (string, error) {
 		return "session-tools", nil
 	})
 	require.NoError(t, err)
