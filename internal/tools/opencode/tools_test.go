@@ -67,6 +67,68 @@ func TestCreateSessionBindsIsolatedWorkspace(t *testing.T) {
 	require.Equal(t, repository, createDirectory)
 }
 
+func TestWorkspaceToolHandlers(t *testing.T) {
+	repository := t.TempDir()
+	runGit(t, repository, "init")
+	runGit(t, repository, "config", "user.name", "Test User")
+	runGit(t, repository, "config", "user.email", "test@example.com")
+	require.NoError(t, os.WriteFile(filepath.Join(repository, "file.txt"), []byte("base\n"), 0o600))
+	runGit(t, repository, "add", "file.txt")
+	runGit(t, repository, "commit", "-m", "base")
+
+	workspaces, err := workspace.NewManager(workspace.Options{
+		StateDir:    filepath.Join(t.TempDir(), "state"),
+		WorktreeDir: filepath.Join(t.TempDir(), "worktrees"),
+		DefaultMode: workspace.ModeAuto,
+	})
+	require.NoError(t, err)
+	record, err := workspaces.Open(t.Context(), repository, "", func(context.Context, string) (string, error) {
+		return "session-tools", nil
+	})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(record.Directory, "file.txt"), []byte("changed\n"), 0o600))
+
+	inspect := workspaceInspectHandler(workspaces)
+	_, inspected, err := inspect(t.Context(), nil, workspaceInspectParams{SessionID: "session-tools"})
+	require.NoError(t, err)
+	require.True(t, inspected.Workspace.HasChanges)
+	require.Equal(t, 1, inspected.Workspace.ChangedFileCount)
+
+	diff := workspaceDiffHandler(workspaces)
+	_, diffResult, err := diff(t.Context(), nil, workspaceDiffParams{SessionID: "session-tools"})
+	require.NoError(t, err)
+	require.Contains(t, diffResult.Text, "+changed")
+
+	verify := workspaceVerifyHandler(NewManager(t.Context(), nil, ManagerOptions{}), workspaces)
+	_, verification, err := verify(t.Context(), nil, workspaceVerifyParams{
+		SessionID: "session-tools",
+		Checks: []workspace.VerificationCheck{
+			{Name: "git status", Command: "git", Args: []string{"status", "--short"}},
+		},
+	})
+	require.NoError(t, err)
+	require.True(t, verification.Passed)
+	require.Contains(t, verification.Results[0].Output, "file.txt")
+
+	_, compact, err := inspect(t.Context(), nil, workspaceInspectParams{SessionID: "session-tools"})
+	require.NoError(t, err)
+	require.Equal(t, 1, compact.Workspace.VerificationCount)
+	require.Empty(t, compact.Workspace.Verification[0].Output)
+
+	cleanup := workspaceCleanupHandler(NewManager(t.Context(), nil, ManagerOptions{}), workspaces)
+	_, _, err = cleanup(t.Context(), nil, workspaceCleanupParams{SessionID: "session-tools"})
+	require.ErrorContains(t, err, "force=true")
+	_, cleanupResult, err := cleanup(t.Context(), nil, workspaceCleanupParams{SessionID: "session-tools", Force: true})
+	require.NoError(t, err)
+	require.True(t, cleanupResult.Removed)
+}
+
+func TestWorkspaceActionsRejectActiveJob(t *testing.T) {
+	mgr := NewManager(t.Context(), nil, ManagerOptions{})
+	mgr.jobs["session-active"] = &Job{SessionID: "session-active", Status: JobRunning}
+	require.EqualError(t, requireInactiveJob(mgr, "session-active", "verify"), "cannot verify workspace while session session-active has an active job")
+}
+
 func runGit(t *testing.T, directory string, args ...string) {
 	t.Helper()
 	argv := append([]string{"-C", directory}, args...)

@@ -18,6 +18,11 @@ import (
 
 const maxJobTimeoutSeconds = 24 * 60 * 60
 
+const (
+	maxDiffChars                  = 100_000
+	maxVerificationTimeoutSeconds = 60 * 60
+)
+
 // Register adds opencode handoff tools to an MCP server.
 func Register(s *mcp.Server, client *Client, mgr *Manager, workspaces *workspace.Manager, opts ExecutorOptions) {
 	mcputil.Register(s, mcputil.ToolDef{
@@ -65,6 +70,30 @@ func Register(s *mcp.Server, client *Client, mgr *Manager, workspaces *workspace
 		Description: "Cancel active opencode execution for a session. Cancellation is idempotent for jobs already in a terminal state.",
 		Flags:       mcputil.Destructive,
 	}, cancelHandler(mgr, workspaces))
+
+	mcputil.Register(s, mcputil.ToolDef{
+		Name:        "handoff_workspace",
+		Description: "Inspect the durable workspace bound to an opencode session, including changed files, commits, diff statistics, and recorded verification checks.",
+		Flags:       mcputil.ReadOnly,
+	}, workspaceInspectHandler(workspaces))
+
+	mcputil.Register(s, mcputil.ToolDef{
+		Name:        "handoff_diff",
+		Description: "Read a bounded tracked-file Git diff for a session workspace relative to its starting commit. Untracked file names are available from handoff_workspace.",
+		Flags:       mcputil.ReadOnly,
+	}, workspaceDiffHandler(workspaces))
+
+	mcputil.Register(s, mcputil.ToolDef{
+		Name:        "handoff_verify",
+		Description: "Run explicit executable-and-argv verification checks in a completed session workspace and durably record structured pass/fail results. Commands run directly without implicit shell expansion.",
+		Flags:       mcputil.Destructive,
+	}, workspaceVerifyHandler(mgr, workspaces))
+
+	mcputil.Register(s, mcputil.ToolDef{
+		Name:        "handoff_cleanup",
+		Description: "Remove an executor-owned worktree after execution. Clean worktrees are removed by default; force=true is required to discard changes or commits.",
+		Flags:       mcputil.Destructive,
+	}, workspaceCleanupHandler(mgr, workspaces))
 
 	mcputil.Register(s, mcputil.ToolDef{
 		Name:        "handoff_permission_reply",
@@ -352,6 +381,15 @@ func checkHandler(client *Client, mgr *Manager, workspaces *workspace.Manager) m
 
 		args.Directory = loc.Directory
 		res, err := doCheck(ctx, client, mgr, args)
+		if err == nil && workspaces != nil {
+			report, ok, inspectErr := workspaces.Inspect(ctx, args.SessionID)
+			if inspectErr != nil {
+				res.WorkspaceError = inspectErr.Error()
+			} else if ok {
+				compactWorkspaceReport(&report, 100, 20, 5, false)
+				res.Workspace = &report
+			}
+		}
 		return nil, res, err
 	}
 }
@@ -405,6 +443,155 @@ func cancelHandler(mgr *Manager, workspaces *workspace.Manager) mcp.ToolHandlerF
 			Aborted:   result.Aborted,
 			Message:   message,
 		}, nil
+	}
+}
+
+type workspaceInspectParams struct {
+	SessionID                 string `json:"session_id" jsonschema:"opencode session id."`
+	ChangedFileLimit          int    `json:"changed_file_limit,omitempty" jsonschema:"Maximum changed files to return. Defaults to 100; maximum 1000."`
+	CommitLimit               int    `json:"commit_limit,omitempty" jsonschema:"Maximum commits to return. Defaults to 50; maximum 200."`
+	VerificationLimit         int    `json:"verification_limit,omitempty" jsonschema:"Maximum recent verification results to return. Defaults to 10; maximum 50."`
+	IncludeVerificationOutput bool   `json:"include_verification_output,omitempty" jsonschema:"Include bounded stdout/stderr recorded for verification checks."`
+}
+
+func workspaceInspectHandler(workspaces *workspace.Manager) mcp.ToolHandlerFor[workspaceInspectParams, WorkspaceInspectResult] {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, args workspaceInspectParams) (*mcp.CallToolResult, WorkspaceInspectResult, error) {
+		if workspaces == nil {
+			return nil, WorkspaceInspectResult{}, fmt.Errorf("workspace management is unavailable")
+		}
+		changedLimit, err := boundedLimit("changed_file_limit", args.ChangedFileLimit, 100, 1000)
+		if err != nil {
+			return nil, WorkspaceInspectResult{}, err
+		}
+		commitLimit, err := boundedLimit("commit_limit", args.CommitLimit, 50, 200)
+		if err != nil {
+			return nil, WorkspaceInspectResult{}, err
+		}
+		verificationLimit, err := boundedLimit("verification_limit", args.VerificationLimit, 10, 50)
+		if err != nil {
+			return nil, WorkspaceInspectResult{}, err
+		}
+		report, ok, err := workspaces.Inspect(ctx, args.SessionID)
+		if err != nil {
+			return nil, WorkspaceInspectResult{}, err
+		}
+		if !ok {
+			return nil, WorkspaceInspectResult{}, fmt.Errorf("no workspace tracked for session %s", args.SessionID)
+		}
+		compactWorkspaceReport(&report, changedLimit, commitLimit, verificationLimit, args.IncludeVerificationOutput)
+		return nil, WorkspaceInspectResult{SessionID: args.SessionID, Workspace: report}, nil
+	}
+}
+
+type workspaceDiffParams struct {
+	SessionID string `json:"session_id" jsonschema:"opencode session id."`
+	MaxChars  int    `json:"max_chars,omitempty" jsonschema:"Maximum diff characters to return. Defaults to 20000; maximum 100000."`
+}
+
+func workspaceDiffHandler(workspaces *workspace.Manager) mcp.ToolHandlerFor[workspaceDiffParams, workspace.Diff] {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, args workspaceDiffParams) (*mcp.CallToolResult, workspace.Diff, error) {
+		if workspaces == nil {
+			return nil, workspace.Diff{}, fmt.Errorf("workspace management is unavailable")
+		}
+		limit, err := boundedLimit("max_chars", args.MaxChars, 20_000, maxDiffChars)
+		if err != nil {
+			return nil, workspace.Diff{}, err
+		}
+		diff, err := workspaces.Diff(ctx, args.SessionID, limit)
+		return nil, diff, err
+	}
+}
+
+type workspaceVerifyParams struct {
+	SessionID      string                        `json:"session_id" jsonschema:"opencode session id."`
+	Checks         []workspace.VerificationCheck `json:"checks" jsonschema:"Verification checks. Each command is an executable plus an argv array; shell syntax is not interpreted."`
+	TimeoutSeconds int                           `json:"timeout_seconds,omitempty" jsonschema:"Overall verification timeout in seconds. Defaults to 600; maximum 3600."`
+}
+
+func workspaceVerifyHandler(mgr *Manager, workspaces *workspace.Manager) mcp.ToolHandlerFor[workspaceVerifyParams, WorkspaceVerifyResult] {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, args workspaceVerifyParams) (*mcp.CallToolResult, WorkspaceVerifyResult, error) {
+		if workspaces == nil {
+			return nil, WorkspaceVerifyResult{}, fmt.Errorf("workspace management is unavailable")
+		}
+		if err := requireInactiveJob(mgr, args.SessionID, "verify"); err != nil {
+			return nil, WorkspaceVerifyResult{}, err
+		}
+		timeout, err := boundedLimit("timeout_seconds", args.TimeoutSeconds, 600, maxVerificationTimeoutSeconds)
+		if err != nil {
+			return nil, WorkspaceVerifyResult{}, err
+		}
+		verifyCtx, cancel := context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
+		defer cancel()
+		results, err := workspaces.Verify(verifyCtx, args.SessionID, args.Checks)
+		if err != nil {
+			return nil, WorkspaceVerifyResult{}, err
+		}
+		passed := len(results) > 0
+		for _, result := range results {
+			passed = passed && result.Status == "passed"
+		}
+		return nil, WorkspaceVerifyResult{SessionID: args.SessionID, Passed: passed, Results: results}, nil
+	}
+}
+
+type workspaceCleanupParams struct {
+	SessionID string `json:"session_id" jsonschema:"opencode session id."`
+	Force     bool   `json:"force,omitempty" jsonschema:"Discard uncommitted changes and commits. Defaults to false."`
+}
+
+func workspaceCleanupHandler(mgr *Manager, workspaces *workspace.Manager) mcp.ToolHandlerFor[workspaceCleanupParams, workspace.CleanupResult] {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, args workspaceCleanupParams) (*mcp.CallToolResult, workspace.CleanupResult, error) {
+		if workspaces == nil {
+			return nil, workspace.CleanupResult{}, fmt.Errorf("workspace management is unavailable")
+		}
+		if err := requireInactiveJob(mgr, args.SessionID, "clean up"); err != nil {
+			return nil, workspace.CleanupResult{}, err
+		}
+		result, err := workspaces.Cleanup(ctx, args.SessionID, args.Force)
+		return nil, result, err
+	}
+}
+
+func requireInactiveJob(mgr *Manager, sessionID, action string) error {
+	if strings.TrimSpace(sessionID) == "" {
+		return fmt.Errorf("session_id is required")
+	}
+	if mgr == nil {
+		return nil
+	}
+	if job, ok := mgr.Job(sessionID); ok && !job.Status.terminal() {
+		return fmt.Errorf("cannot %s workspace while session %s has an active job", action, sessionID)
+	}
+	return nil
+}
+
+func boundedLimit(name string, value, defaultValue, maximum int) (int, error) {
+	if value < 0 {
+		return 0, fmt.Errorf("%s must not be negative", name)
+	}
+	if value == 0 {
+		return defaultValue, nil
+	}
+	if value > maximum {
+		return 0, fmt.Errorf("%s must not exceed %d", name, maximum)
+	}
+	return value, nil
+}
+
+func compactWorkspaceReport(report *workspace.Report, changedLimit, commitLimit, verificationLimit int, includeVerificationOutput bool) {
+	if len(report.ChangedFiles) > changedLimit {
+		report.ChangedFiles = report.ChangedFiles[:changedLimit]
+	}
+	if len(report.Commits) > commitLimit {
+		report.Commits = report.Commits[:commitLimit]
+	}
+	if len(report.Verification) > verificationLimit {
+		report.Verification = report.Verification[len(report.Verification)-verificationLimit:]
+	}
+	if !includeVerificationOutput {
+		for index := range report.Verification {
+			report.Verification[index].Output = ""
+		}
 	}
 }
 

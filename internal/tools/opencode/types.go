@@ -120,16 +120,18 @@ type HandoffFireResult struct {
 }
 
 type HandoffCheckResult struct {
-	SessionID          string           `json:"session_id"`
-	Status             string           `json:"status,omitempty"`
-	IdempotencyKey     string           `json:"idempotency_key,omitempty"`
-	Deadline           string           `json:"deadline,omitempty"`
-	FinalText          string           `json:"final_text,omitempty"`
-	PendingPermissions []RequestSummary `json:"pending_permissions,omitempty"`
-	PendingQuestions   []RequestSummary `json:"pending_questions,omitempty"`
-	JobError           string           `json:"job_error,omitempty"`
-	Errors             []string         `json:"errors,omitempty"`
-	Messages           []MessageSummary `json:"messages,omitempty"`
+	SessionID          string            `json:"session_id"`
+	Status             string            `json:"status,omitempty"`
+	IdempotencyKey     string            `json:"idempotency_key,omitempty"`
+	Deadline           string            `json:"deadline,omitempty"`
+	FinalText          string            `json:"final_text,omitempty"`
+	PendingPermissions []RequestSummary  `json:"pending_permissions,omitempty"`
+	PendingQuestions   []RequestSummary  `json:"pending_questions,omitempty"`
+	JobError           string            `json:"job_error,omitempty"`
+	Errors             []string          `json:"errors,omitempty"`
+	Messages           []MessageSummary  `json:"messages,omitempty"`
+	Workspace          *workspace.Report `json:"workspace,omitempty"`
+	WorkspaceError     string            `json:"workspace_error,omitempty"`
 }
 
 type HandoffCancelResult struct {
@@ -137,6 +139,17 @@ type HandoffCancelResult struct {
 	Status    string `json:"status"`
 	Aborted   bool   `json:"aborted"`
 	Message   string `json:"message,omitempty"`
+}
+
+type WorkspaceInspectResult struct {
+	SessionID string           `json:"session_id"`
+	Workspace workspace.Report `json:"workspace"`
+}
+
+type WorkspaceVerifyResult struct {
+	SessionID string                         `json:"session_id"`
+	Passed    bool                           `json:"passed"`
+	Results   []workspace.VerificationResult `json:"results"`
 }
 
 type MessageSummary struct {
