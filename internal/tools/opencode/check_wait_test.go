@@ -10,7 +10,9 @@ import (
 	opencodeapi "github.com/pradhankukiran/codex-opencode-executor/internal/tools/opencode/opencodeapi"
 )
 
-func checkWaitHandlerMock(
+// jobWaitHandlerMock returns early from OpenCode V2SessionWait so handler tests
+// prove wait_seconds is driven by Manager job completion, not the remote API.
+func jobWaitHandlerMock(
 	prompt func(context.Context) (opencodeapi.SessionMessageRes, error),
 ) *HandlerMock {
 	return &HandlerMock{
@@ -33,8 +35,6 @@ func checkWaitHandlerMock(
 		V2QuestionRequestListFunc: func(context.Context, opencodeapi.V2QuestionRequestListParams) (opencodeapi.V2QuestionRequestListRes, error) {
 			return &opencodeapi.V2QuestionRequestListOK{Data: []opencodeapi.QuestionV2Request{}}, nil
 		},
-		// Simulates the production defect: OpenCode wait returns immediately
-		// while the executor job is still running.
 		V2SessionWaitFunc: func(context.Context, opencodeapi.V2SessionWaitParams) (opencodeapi.V2SessionWaitRes, error) {
 			return &opencodeapi.V2SessionWaitNoContent{}, nil
 		},
@@ -49,7 +49,7 @@ func TestCheckHandlerWaitSecondsBlocksUntilJobTerminal(t *testing.T) {
 
 	promptStarted := make(chan struct{})
 	promptRelease := make(chan struct{})
-	handler := checkWaitHandlerMock(func(ctx context.Context) (opencodeapi.SessionMessageRes, error) {
+	handler := jobWaitHandlerMock(func(ctx context.Context) (opencodeapi.SessionMessageRes, error) {
 		close(promptStarted)
 		select {
 		case <-promptRelease:
@@ -105,7 +105,7 @@ func TestCheckHandlerWaitSecondsTimeout(t *testing.T) {
 	t.Parallel()
 
 	promptStarted := make(chan struct{})
-	handler := checkWaitHandlerMock(func(ctx context.Context) (opencodeapi.SessionMessageRes, error) {
+	handler := jobWaitHandlerMock(func(ctx context.Context) (opencodeapi.SessionMessageRes, error) {
 		close(promptStarted)
 		<-ctx.Done()
 		return nil, ctx.Err()
@@ -136,7 +136,7 @@ func TestCheckHandlerZeroWaitIsNonBlocking(t *testing.T) {
 	t.Parallel()
 
 	promptStarted := make(chan struct{})
-	handler := checkWaitHandlerMock(func(ctx context.Context) (opencodeapi.SessionMessageRes, error) {
+	handler := jobWaitHandlerMock(func(ctx context.Context) (opencodeapi.SessionMessageRes, error) {
 		close(promptStarted)
 		<-ctx.Done()
 		return nil, ctx.Err()
@@ -162,7 +162,7 @@ func TestCheckHandlerWaitSecondsContextCancel(t *testing.T) {
 	t.Parallel()
 
 	promptStarted := make(chan struct{})
-	handler := checkWaitHandlerMock(func(ctx context.Context) (opencodeapi.SessionMessageRes, error) {
+	handler := jobWaitHandlerMock(func(ctx context.Context) (opencodeapi.SessionMessageRes, error) {
 		close(promptStarted)
 		<-ctx.Done()
 		return nil, ctx.Err()
@@ -201,7 +201,7 @@ func TestCheckHandlerWaitSecondsContextCancel(t *testing.T) {
 func TestCheckHandlerWaitSecondsAlreadyTerminal(t *testing.T) {
 	t.Parallel()
 
-	handler := checkWaitHandlerMock(func(context.Context) (opencodeapi.SessionMessageRes, error) {
+	handler := jobWaitHandlerMock(func(context.Context) (opencodeapi.SessionMessageRes, error) {
 		return &opencodeapi.SessionMessageOK{
 			Info: opencodeapi.SessionMessageOKInfo{ID: "msg-done", Role: "assistant"},
 		}, nil
@@ -224,4 +224,186 @@ func TestCheckHandlerWaitSecondsAlreadyTerminal(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, string(JobDone), res.Status)
 	require.Less(t, time.Since(start), 500*time.Millisecond)
+}
+
+func TestFireHandlerWaitSecondsBlocksUntilJobTerminal(t *testing.T) {
+	t.Parallel()
+
+	promptStarted := make(chan struct{})
+	promptRelease := make(chan struct{})
+	handler := jobWaitHandlerMock(func(ctx context.Context) (opencodeapi.SessionMessageRes, error) {
+		close(promptStarted)
+		select {
+		case <-promptRelease:
+			return &opencodeapi.SessionMessageOK{
+				Info: opencodeapi.SessionMessageOKInfo{ID: "msg-fire", Role: "assistant"},
+			}, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	})
+	client := setupTestServer(t, handler)
+	mgr := NewManager(t.Context(), client, ManagerOptions{DefaultTimeout: time.Minute})
+	h := fireHandler(client, mgr, nil, ExecutorOptions{})
+
+	type fireOutcome struct {
+		res HandoffFireResult
+		err error
+	}
+	done := make(chan fireOutcome, 1)
+	go func() {
+		_, res, err := h(t.Context(), nil, fireParams{
+			SessionID:   "ses-fire-wait",
+			Prompt:      "long running",
+			WaitSeconds: 30,
+		})
+		done <- fireOutcome{res: res, err: err}
+	}()
+
+	<-promptStarted
+
+	select {
+	case outcome := <-done:
+		t.Fatalf("handoff_fire returned while job still running: status=%s err=%v", outcome.res.Status, outcome.err)
+	case <-time.After(75 * time.Millisecond):
+	}
+
+	close(promptRelease)
+
+	select {
+	case outcome := <-done:
+		require.NoError(t, outcome.err)
+		require.Equal(t, string(JobDone), outcome.res.Status)
+		require.False(t, outcome.res.Duplicate)
+	case <-time.After(2 * time.Second):
+		t.Fatal("handoff_fire did not wake when job reached terminal state")
+	}
+}
+
+func TestFireHandlerWaitSecondsTimeout(t *testing.T) {
+	t.Parallel()
+
+	promptStarted := make(chan struct{})
+	handler := jobWaitHandlerMock(func(ctx context.Context) (opencodeapi.SessionMessageRes, error) {
+		close(promptStarted)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	client := setupTestServer(t, handler)
+	mgr := NewManager(t.Context(), client, ManagerOptions{DefaultTimeout: time.Minute})
+	h := fireHandler(client, mgr, nil, ExecutorOptions{})
+
+	start := time.Now()
+	done := make(chan struct {
+		res HandoffFireResult
+		err error
+	}, 1)
+	go func() {
+		_, res, err := h(t.Context(), nil, fireParams{
+			SessionID:   "ses-fire-timeout",
+			Prompt:      "never finishes in time",
+			WaitSeconds: 1,
+		})
+		done <- struct {
+			res HandoffFireResult
+			err error
+		}{res: res, err: err}
+	}()
+	<-promptStarted
+
+	outcome := <-done
+	elapsed := time.Since(start)
+	require.NoError(t, outcome.err)
+	require.Equal(t, string(JobRunning), outcome.res.Status)
+	require.GreaterOrEqual(t, elapsed, 900*time.Millisecond)
+	require.Less(t, elapsed, 5*time.Second)
+}
+
+func TestFireHandlerZeroWaitIsNonBlocking(t *testing.T) {
+	t.Parallel()
+
+	promptStarted := make(chan struct{})
+	handler := jobWaitHandlerMock(func(ctx context.Context) (opencodeapi.SessionMessageRes, error) {
+		close(promptStarted)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	client := setupTestServer(t, handler)
+	mgr := NewManager(t.Context(), client, ManagerOptions{DefaultTimeout: time.Minute})
+	h := fireHandler(client, mgr, nil, ExecutorOptions{})
+
+	start := time.Now()
+	_, res, err := h(t.Context(), nil, fireParams{
+		SessionID:   "ses-fire-zero",
+		Prompt:      "running",
+		WaitSeconds: 0,
+	})
+	require.NoError(t, err)
+	require.Equal(t, string(JobRunning), res.Status)
+	require.Less(t, time.Since(start), 500*time.Millisecond)
+	<-promptStarted
+}
+
+func TestFireHandlerWaitSecondsDuplicateIdempotency(t *testing.T) {
+	t.Parallel()
+
+	promptStarted := make(chan struct{})
+	promptRelease := make(chan struct{})
+	handler := jobWaitHandlerMock(func(ctx context.Context) (opencodeapi.SessionMessageRes, error) {
+		close(promptStarted)
+		select {
+		case <-promptRelease:
+			return &opencodeapi.SessionMessageOK{
+				Info: opencodeapi.SessionMessageOKInfo{ID: "msg-dup", Role: "assistant"},
+			}, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	})
+	client := setupTestServer(t, handler)
+	mgr := NewManager(t.Context(), client, ManagerOptions{DefaultTimeout: time.Minute})
+	h := fireHandler(client, mgr, nil, ExecutorOptions{})
+
+	args := fireParams{
+		SessionID:      "ses-fire-dup",
+		Prompt:         "idempotent",
+		IdempotencyKey: "key-1",
+		WaitSeconds:    0,
+	}
+	_, first, err := h(t.Context(), nil, args)
+	require.NoError(t, err)
+	require.False(t, first.Duplicate)
+	require.Equal(t, string(JobRunning), first.Status)
+	<-promptStarted
+
+	// Duplicate with wait should block on the original job and report terminal status.
+	type fireOutcome struct {
+		res HandoffFireResult
+		err error
+	}
+	done := make(chan fireOutcome, 1)
+	go func() {
+		dupArgs := args
+		dupArgs.WaitSeconds = 30
+		_, res, err := h(t.Context(), nil, dupArgs)
+		done <- fireOutcome{res: res, err: err}
+	}()
+
+	select {
+	case outcome := <-done:
+		t.Fatalf("duplicate handoff_fire returned while job still running: status=%s err=%v", outcome.res.Status, outcome.err)
+	case <-time.After(75 * time.Millisecond):
+	}
+
+	close(promptRelease)
+
+	select {
+	case outcome := <-done:
+		require.NoError(t, outcome.err)
+		require.True(t, outcome.res.Duplicate)
+		require.Equal(t, string(JobDone), outcome.res.Status)
+		require.Equal(t, "key-1", outcome.res.IdempotencyKey)
+	case <-time.After(2 * time.Second):
+		t.Fatal("duplicate handoff_fire did not wake when job reached terminal state")
+	}
 }

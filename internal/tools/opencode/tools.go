@@ -326,7 +326,9 @@ func fireHandler(client *Client, mgr *Manager, workspaces *workspace.Manager, op
 		if args.WaitSeconds > 0 {
 			waitCtx, cancel := context.WithTimeout(ctx, time.Duration(min(args.WaitSeconds, 300))*time.Second)
 			defer cancel()
-			_ = client.Wait(waitCtx, loc, job.SessionID)
+			// Wait on the local job lifecycle. OpenCode session wait can return
+			// while SubmitJob's prompt goroutine is still running.
+			_ = mgr.Wait(waitCtx, job.SessionID)
 			if current, ok := mgr.Job(job.SessionID); ok {
 				res.Status = string(current.Status)
 				res.PromptMessageID = current.PromptMessageID
