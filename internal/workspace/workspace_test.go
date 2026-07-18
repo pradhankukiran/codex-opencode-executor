@@ -24,7 +24,7 @@ func TestManagerWorktreeLifecycle(t *testing.T) {
 	require.NoError(t, err)
 
 	var openedDirectory string
-	record, err := manager.Open(t.Context(), repository, "", func(_ context.Context, directory string) (string, error) {
+	record, err := manager.Open(t.Context(), OpenOptions{Directory: repository}, func(_ context.Context, directory string) (string, error) {
 		openedDirectory = directory
 		return "session-1", nil
 	})
@@ -87,7 +87,7 @@ func TestManagerTracksCommits(t *testing.T) {
 	repository := newRepository(t)
 	manager, err := NewManager(Options{WorktreeDir: t.TempDir(), DefaultMode: ModeWorktree})
 	require.NoError(t, err)
-	record, err := manager.Open(t.Context(), repository, "", func(_ context.Context, _ string) (string, error) {
+	record, err := manager.Open(t.Context(), OpenOptions{Directory: repository}, func(_ context.Context, _ string) (string, error) {
 		return "session-commit", nil
 	})
 	require.NoError(t, err)
@@ -112,7 +112,7 @@ func TestManagerAutoUsesNonGitDirectoryDirectly(t *testing.T) {
 	directory := t.TempDir()
 	manager, err := NewManager(Options{WorktreeDir: t.TempDir(), DefaultMode: ModeAuto})
 	require.NoError(t, err)
-	record, err := manager.Open(t.Context(), directory, "", func(_ context.Context, opened string) (string, error) {
+	record, err := manager.Open(t.Context(), OpenOptions{Directory: directory}, func(_ context.Context, opened string) (string, error) {
 		require.Equal(t, directory, opened)
 		return "session-direct", nil
 	})
@@ -125,14 +125,14 @@ func TestManagerAutoUsesDirtyRepositoryDirectly(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(repository, "tracked.txt"), []byte("dirty\n"), 0o600))
 	manager, err := NewManager(Options{WorktreeDir: t.TempDir(), DefaultMode: ModeAuto})
 	require.NoError(t, err)
-	record, err := manager.Open(t.Context(), repository, "", func(_ context.Context, opened string) (string, error) {
+	record, err := manager.Open(t.Context(), OpenOptions{Directory: repository}, func(_ context.Context, opened string) (string, error) {
 		require.Equal(t, repository, opened)
 		return "session-dirty-auto", nil
 	})
 	require.NoError(t, err)
 	require.Equal(t, ModeNone, record.Mode)
 
-	_, err = manager.Open(t.Context(), repository, ModeWorktree, func(context.Context, string) (string, error) {
+	_, err = manager.Open(t.Context(), OpenOptions{Directory: repository, Mode: ModeWorktree}, func(context.Context, string) (string, error) {
 		return "session-dirty-explicit", nil
 	})
 	require.EqualError(t, err, "worktree isolation requires a clean Git source; commit or stash changes, or use isolation mode none")
@@ -147,7 +147,7 @@ func TestManagerPreservesRepositorySubdirectory(t *testing.T) {
 	git(t, repository, "commit", "-m", "add nested project")
 	manager, err := NewManager(Options{WorktreeDir: t.TempDir(), DefaultMode: ModeWorktree})
 	require.NoError(t, err)
-	record, err := manager.Open(t.Context(), subdirectory, "", func(_ context.Context, opened string) (string, error) {
+	record, err := manager.Open(t.Context(), OpenOptions{Directory: subdirectory}, func(_ context.Context, opened string) (string, error) {
 		require.Equal(t, filepath.Join(filepath.Dir(filepath.Dir(opened)), "nested", "project"), opened)
 		return "session-subdirectory", nil
 	})
@@ -162,7 +162,7 @@ func TestManagerRollsBackFailedOpen(t *testing.T) {
 	manager, err := NewManager(Options{WorktreeDir: worktreeDir, DefaultMode: ModeWorktree})
 	require.NoError(t, err)
 	var openedDirectory string
-	_, err = manager.Open(t.Context(), repository, "", func(_ context.Context, directory string) (string, error) {
+	_, err = manager.Open(t.Context(), OpenOptions{Directory: repository}, func(_ context.Context, directory string) (string, error) {
 		openedDirectory = directory
 		return "", errors.New("open failed")
 	})
@@ -176,7 +176,7 @@ func TestManagerVerificationTimeout(t *testing.T) {
 	directory := t.TempDir()
 	manager, err := NewManager(Options{DefaultMode: ModeNone})
 	require.NoError(t, err)
-	_, err = manager.Open(t.Context(), directory, "", func(context.Context, string) (string, error) {
+	_, err = manager.Open(t.Context(), OpenOptions{Directory: directory}, func(context.Context, string) (string, error) {
 		return "session-timeout", nil
 	})
 	require.NoError(t, err)
