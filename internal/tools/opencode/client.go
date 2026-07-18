@@ -161,7 +161,15 @@ func (c *Client) Agents(ctx context.Context, loc Location) ([]Agent, error) {
 }
 
 func (c *Client) ProvidersAndModels(ctx context.Context, loc Location) (ModelsResult, error) {
-	res, ok, err := c.apiProvidersAndModels(ctx, loc)
+	res, ok, err := c.currentProvidersAndModels(ctx, loc)
+	if err != nil {
+		return ModelsResult{}, err
+	}
+	if ok {
+		return res, nil
+	}
+
+	res, ok, err = c.apiProvidersAndModels(ctx, loc)
 	if err != nil {
 		return ModelsResult{}, err
 	}
@@ -169,6 +177,83 @@ func (c *Client) ProvidersAndModels(ctx context.Context, loc Location) (ModelsRe
 		return res, nil
 	}
 	return ModelsResult{}, fmt.Errorf("failed to retrieve providers and models")
+}
+
+type currentProviderList struct {
+	All []struct {
+		ID     string `json:"id"`
+		Name   string `json:"name"`
+		Models map[string]struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		} `json:"models"`
+	} `json:"all"`
+}
+
+func (c *Client) currentProvidersAndModels(ctx context.Context, loc Location) (ModelsResult, bool, error) {
+	u, err := url.Parse(c.baseURL)
+	if err != nil {
+		return ModelsResult{}, false, fmt.Errorf("parse opencode base URL: %w", err)
+	}
+	u.Path = strings.TrimRight(u.Path, "/") + "/provider"
+	query := u.Query()
+	if dir := c.dir(loc); dir != "" {
+		query.Set("directory", dir)
+	}
+	if loc.Workspace != "" {
+		query.Set("workspace", loc.Workspace)
+	}
+	u.RawQuery = query.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return ModelsResult{}, false, fmt.Errorf("create provider request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+
+	response, err := c.httpClient.Do(req)
+	if err != nil {
+		return ModelsResult{}, false, fmt.Errorf("GET /provider: %w", err)
+	}
+	defer response.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(response.Body, 32<<20))
+	if err != nil {
+		return ModelsResult{}, false, fmt.Errorf("read provider response: %w", err)
+	}
+	if response.StatusCode == http.StatusNotFound {
+		return ModelsResult{}, false, nil
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return ModelsResult{}, false, fmt.Errorf("GET /provider: status %s: %s", response.Status, strings.TrimSpace(string(body)))
+	}
+
+	var providerList currentProviderList
+	if err := json.Unmarshal(body, &providerList); err != nil {
+		return ModelsResult{}, false, fmt.Errorf("decode provider response: %w", err)
+	}
+
+	result := ModelsResult{
+		Providers: make([]ProviderSummary, 0, len(providerList.All)),
+	}
+	for _, provider := range providerList.All {
+		providerName := cmp.Or(provider.Name, provider.ID)
+		result.Providers = append(result.Providers, ProviderSummary{
+			ID:     provider.ID,
+			Name:   providerName,
+			Models: len(provider.Models),
+		})
+		for modelKey, model := range provider.Models {
+			modelID := cmp.Or(model.ID, modelKey)
+			result.Models = append(result.Models, ModelSummary{
+				ProviderID: provider.ID,
+				ID:         modelID,
+				Name:       cmp.Or(model.Name, modelID),
+			})
+		}
+	}
+
+	return sortModelsResult(result), true, nil
 }
 
 func (c *Client) apiProvidersAndModels(ctx context.Context, loc Location) (ModelsResult, bool, error) {

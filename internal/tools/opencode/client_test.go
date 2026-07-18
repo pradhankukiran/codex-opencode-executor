@@ -301,6 +301,46 @@ func TestClient_ProvidersAndModels(t *testing.T) {
 	require.Equal(t, "anthropic", res.Models[0].ProviderID)
 }
 
+func TestClient_ProvidersAndModelsCurrentAPI(t *testing.T) {
+	t.Parallel()
+
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/provider":
+			require.Equal(t, "/src", r.URL.Query().Get("directory"))
+			_, _ = w.Write([]byte(`{
+				"all": [{
+					"id": "xai",
+					"name": "xAI",
+					"models": {
+						"grok-4.5": {"id": "grok-4.5", "name": "Grok 4.5"}
+					}
+				}],
+				"connected": ["xai"],
+				"default": {"xai": "grok-4.5"}
+			}`))
+		case "/api/provider":
+			_, _ = w.Write([]byte(`{
+				"data": [{"id": "xai", "name": "xAI", "api": {}, "request": {}}],
+				"location": {"directory": "/src"}
+			}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	client := newTestClient(t, Config{BaseURL: server.URL})
+	res, err := client.ProvidersAndModels(t.Context(), Location{Directory: "/src"})
+	require.NoError(t, err)
+	require.Equal(t, []string{"/provider"}, paths)
+	require.Equal(t, []ProviderSummary{{ID: "xai", Name: "xAI", Models: 1}}, res.Providers)
+	require.Equal(t, []ModelSummary{{ProviderID: "xai", ID: "grok-4.5", Name: "Grok 4.5"}}, res.Models)
+}
+
 func TestClient_Sessions(t *testing.T) {
 	t.Parallel()
 
