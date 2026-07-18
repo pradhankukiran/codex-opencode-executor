@@ -256,6 +256,9 @@ func createSessionHandler(client *Client, workspaces *workspace.Manager, opts Ex
 		var session Session
 		var record *workspace.Record
 		if workspaces == nil {
+			if args.CreateDirectory {
+				return nil, CreateSessionResult{}, fmt.Errorf("create_directory requires workspace management")
+			}
 			session, err = client.CreateSession(ctx, loc, req)
 		} else {
 			created, openErr := workspaces.Open(ctx, workspace.OpenOptions{

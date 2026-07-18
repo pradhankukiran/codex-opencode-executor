@@ -58,6 +58,22 @@ func TestCreateSessionCreateDirectoryGreenfield(t *testing.T) {
 	require.ErrorContains(t, err, "inspect source directory")
 }
 
+func TestCreateSessionCreateDirectoryRequiresWorkspaceManager(t *testing.T) {
+	handler := &HandlerMock{
+		SessionCreateFunc: func(context.Context, opencodeapi.OptSessionCreateReq, opencodeapi.SessionCreateParams) (opencodeapi.SessionCreateRes, error) {
+			t.Fatal("CreateSession must not run without workspace management")
+			return nil, nil
+		},
+	}
+	client := setupTestServer(t, handler)
+	h := createSessionHandler(client, nil, ExecutorOptions{})
+	_, _, err := h(t.Context(), nil, createSessionParams{
+		locationParams:  locationParams{Directory: filepath.Join(t.TempDir(), "x")},
+		CreateDirectory: true,
+	})
+	require.ErrorContains(t, err, "workspace management")
+}
+
 func TestCreateSessionBindsIsolatedWorkspace(t *testing.T) {
 	repository := t.TempDir()
 	runGit(t, repository, "init")

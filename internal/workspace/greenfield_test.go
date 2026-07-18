@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -154,6 +157,7 @@ func TestGreenfieldInspectBeforeAndAfterGitInit(t *testing.T) {
 	git(t, target, "init")
 	git(t, target, "config", "user.name", "Test User")
 	git(t, target, "config", "user.email", "test@example.com")
+	emptyTree := emptyTreeOID(t, target)
 
 	unborn, ok, err := manager.Inspect(t.Context(), "session-inspect")
 	require.NoError(t, err)
@@ -161,7 +165,7 @@ func TestGreenfieldInspectBeforeAndAfterGitInit(t *testing.T) {
 	require.True(t, unborn.Available)
 	require.Equal(t, target, unborn.RepositoryRoot)
 	require.Empty(t, unborn.HeadCommit)
-	require.Equal(t, emptyTreeID, unborn.BaseCommit)
+	require.Equal(t, emptyTree, unborn.BaseCommit)
 
 	require.NoError(t, os.WriteFile(filepath.Join(target, "readme.txt"), []byte("hello\n"), 0o600))
 	git(t, target, "add", "readme.txt")
@@ -175,7 +179,7 @@ func TestGreenfieldInspectBeforeAndAfterGitInit(t *testing.T) {
 	require.True(t, ok)
 	require.True(t, after.Available)
 	require.Equal(t, target, after.RepositoryRoot)
-	require.Equal(t, emptyTreeID, after.BaseCommit)
+	require.Equal(t, emptyTree, after.BaseCommit)
 	require.NotEmpty(t, after.HeadCommit)
 	require.True(t, after.Dirty)
 	require.True(t, after.HasChanges)
@@ -188,7 +192,7 @@ func TestGreenfieldInspectBeforeAndAfterGitInit(t *testing.T) {
 
 	diff, err := manager.Diff(t.Context(), "session-inspect", 20_000)
 	require.NoError(t, err)
-	require.Equal(t, emptyTreeID, diff.BaseCommit)
+	require.Equal(t, emptyTree, diff.BaseCommit)
 	require.Contains(t, diff.Text, "readme.txt")
 	require.Contains(t, diff.Text, "+hello")
 
@@ -206,6 +210,163 @@ func TestGreenfieldInspectBeforeAndAfterGitInit(t *testing.T) {
 	require.True(t, persisted.Owned)
 	require.Equal(t, target, persisted.Directory)
 	require.Len(t, persisted.Verification, 1)
+}
+
+func TestGreenfieldIgnoresAncestorRepository(t *testing.T) {
+	ancestor := newRepository(t)
+	parent := filepath.Join(ancestor, "nested-parent")
+	require.NoError(t, os.MkdirAll(parent, 0o700))
+	target := filepath.Join(parent, "child-app")
+
+	manager, err := NewManager(Options{StateDir: t.TempDir(), DefaultMode: ModeNone})
+	require.NoError(t, err)
+	_, err = manager.Open(t.Context(), OpenOptions{
+		Directory:       target,
+		CreateDirectory: true,
+	}, func(context.Context, string) (string, error) {
+		return "session-nested", nil
+	})
+	require.NoError(t, err)
+
+	report, ok, err := manager.Inspect(t.Context(), "session-nested")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.True(t, report.Available)
+	require.Empty(t, report.RepositoryRoot)
+	require.Empty(t, report.BaseCommit)
+	require.Empty(t, report.HeadCommit)
+	require.Zero(t, report.CommitCount)
+	require.Empty(t, report.ChangedFiles)
+
+	git(t, target, "init")
+	emptyTree := emptyTreeOID(t, target)
+	after, ok, err := manager.Inspect(t.Context(), "session-nested")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, target, after.RepositoryRoot)
+	require.Equal(t, emptyTree, after.BaseCommit)
+	require.Empty(t, after.HeadCommit)
+}
+
+func TestGreenfieldUnbornStagedDiff(t *testing.T) {
+	parent := t.TempDir()
+	target := filepath.Join(parent, "staged-app")
+	manager, err := NewManager(Options{StateDir: t.TempDir(), DefaultMode: ModeNone})
+	require.NoError(t, err)
+	_, err = manager.Open(t.Context(), OpenOptions{
+		Directory:       target,
+		CreateDirectory: true,
+	}, func(context.Context, string) (string, error) {
+		return "session-staged", nil
+	})
+	require.NoError(t, err)
+
+	git(t, target, "init")
+	require.NoError(t, os.WriteFile(filepath.Join(target, "staged.txt"), []byte("staged body\n"), 0o600))
+	git(t, target, "add", "staged.txt")
+	require.NoError(t, os.WriteFile(filepath.Join(target, "loose.txt"), []byte("loose\n"), 0o600))
+	emptyTree := emptyTreeOID(t, target)
+
+	report, ok, err := manager.Inspect(t.Context(), "session-staged")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.True(t, report.Available)
+	require.Empty(t, report.HeadCommit)
+	require.Equal(t, emptyTree, report.BaseCommit)
+	require.True(t, report.Dirty)
+	require.True(t, report.HasChanges)
+	require.ElementsMatch(t, []ChangedFile{
+		{Status: "A", Path: "staged.txt"},
+		{Status: "??", Path: "loose.txt"},
+	}, filterChangedNames(report.ChangedFiles))
+
+	diff, err := manager.Diff(t.Context(), "session-staged", 20_000)
+	require.NoError(t, err)
+	require.Equal(t, emptyTree, diff.BaseCommit)
+	require.Empty(t, diff.HeadCommit)
+	require.Contains(t, diff.Text, "staged.txt")
+	require.Contains(t, diff.Text, "+staged body")
+	require.NotContains(t, diff.Text, "loose.txt")
+}
+
+func TestGreenfieldSHA256EmptyTree(t *testing.T) {
+	if !supportsSHA256ObjectFormat(t) {
+		t.Skip("git init --object-format=sha256 is unsupported")
+	}
+	parent := t.TempDir()
+	target := filepath.Join(parent, "sha256-app")
+	manager, err := NewManager(Options{StateDir: t.TempDir(), DefaultMode: ModeNone})
+	require.NoError(t, err)
+	_, err = manager.Open(t.Context(), OpenOptions{
+		Directory:       target,
+		CreateDirectory: true,
+	}, func(context.Context, string) (string, error) {
+		return "session-sha256", nil
+	})
+	require.NoError(t, err)
+
+	git(t, target, "init", "--object-format=sha256")
+	require.NoError(t, os.WriteFile(filepath.Join(target, "note.txt"), []byte("sha256\n"), 0o600))
+	git(t, target, "add", "note.txt")
+	emptyTree := emptyTreeOID(t, target)
+	require.Len(t, emptyTree, 64)
+
+	report, ok, err := manager.Inspect(t.Context(), "session-sha256")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, emptyTree, report.BaseCommit)
+	require.Equal(t, target, report.RepositoryRoot)
+
+	diff, err := manager.Diff(t.Context(), "session-sha256", 20_000)
+	require.NoError(t, err)
+	require.Equal(t, emptyTree, diff.BaseCommit)
+	require.Contains(t, diff.Text, "+sha256")
+}
+
+func TestOpenCreateDirectoryRejectsSymlinkParent(t *testing.T) {
+	root := t.TempDir()
+	realParent := filepath.Join(root, "real-parent")
+	require.NoError(t, os.Mkdir(realParent, 0o700))
+	linkParent := filepath.Join(root, "link-parent")
+	require.NoError(t, os.Symlink(realParent, linkParent))
+	target := filepath.Join(linkParent, "child")
+
+	manager, err := NewManager(Options{DefaultMode: ModeNone})
+	require.NoError(t, err)
+	_, err = manager.Open(t.Context(), OpenOptions{
+		Directory:       target,
+		CreateDirectory: true,
+	}, func(context.Context, string) (string, error) {
+		t.Fatal("opener must not run for symlink parent")
+		return "", nil
+	})
+	require.ErrorContains(t, err, "symlink")
+	require.NoDirExists(t, filepath.Join(realParent, "child"))
+}
+
+func TestGreenfieldCleanupRefusesMismatchedOwnedPaths(t *testing.T) {
+	parent := t.TempDir()
+	target := filepath.Join(parent, "owned")
+	require.NoError(t, os.Mkdir(target, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(target, "keep.txt"), []byte("keep\n"), 0o600))
+
+	manager, err := NewManager(Options{StateDir: t.TempDir(), DefaultMode: ModeNone})
+	require.NoError(t, err)
+	manager.mu.Lock()
+	manager.records["session-bad-paths"] = Record{
+		SessionID:       "session-bad-paths",
+		Mode:            ModeGreenfield,
+		Owned:           true,
+		SourceDirectory: target,
+		Directory:       filepath.Join(parent, "other-path"),
+		CreatedAt:       time.Now().UTC(),
+	}
+	manager.mu.Unlock()
+
+	_, err = manager.Cleanup(t.Context(), "session-bad-paths", true)
+	require.Error(t, err)
+	require.DirExists(t, target)
+	require.FileExists(t, filepath.Join(target, "keep.txt"))
 }
 
 func TestGreenfieldCleanupRules(t *testing.T) {
@@ -303,4 +464,18 @@ func filterChangedNames(files []ChangedFile) []ChangedFile {
 		out = append(out, ChangedFile{Status: status, Path: file.Path})
 	}
 	return out
+}
+
+func emptyTreeOID(t *testing.T, directory string) string {
+	t.Helper()
+	output, err := exec.Command("git", "-C", directory, "hash-object", "-t", "tree", "/dev/null").CombinedOutput()
+	require.NoError(t, err, string(output))
+	return strings.TrimSpace(string(output))
+}
+
+func supportsSHA256ObjectFormat(t *testing.T) bool {
+	t.Helper()
+	directory := t.TempDir()
+	output, err := exec.Command("git", "-C", directory, "init", "--object-format=sha256").CombinedOutput()
+	return err == nil && !strings.Contains(strings.ToLower(string(output)), "unknown")
 }

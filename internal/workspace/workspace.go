@@ -24,9 +24,6 @@ const (
 	maxSessionIDLength     = 256
 	maxVerificationChecks  = 20
 	maxVerificationHistory = 100
-	// emptyTreeID is the well-known Git empty-tree object used as the synthetic
-	// base for greenfield repositories (whole-project history vs nothing).
-	emptyTreeID = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 )
 
 type Mode string
@@ -288,8 +285,14 @@ func (m *Manager) Inspect(ctx context.Context, sessionID string) (Report, bool, 
 func (m *Manager) inspectGit(ctx context.Context, report Report, record Record, greenfield bool) (Report, bool, error) {
 	baseCommit := record.BaseCommit
 	if greenfield {
-		baseCommit = emptyTreeID
-		report.BaseCommit = emptyTreeID
+		if baseCommit == "" {
+			oid, err := ensureEmptyTree(ctx, record.Directory)
+			if err != nil {
+				return Report{}, true, err
+			}
+			baseCommit = oid
+		}
+		report.BaseCommit = baseCommit
 	}
 
 	head, headErr := gitOutput(ctx, record.Directory, "rev-parse", "HEAD")
@@ -306,38 +309,37 @@ func (m *Manager) inspectGit(ctx context.Context, report Report, record Record, 
 	report.Dirty = len(workingFiles) > 0
 
 	if baseCommit != "" {
-		if !unborn {
-			changed, err := gitBytes(ctx, record.Directory, "diff", "--name-status", "-z", "--no-renames", baseCommit)
-			if err != nil {
-				return Report{}, true, err
-			}
-			report.ChangedFiles = parseDiffStatus(changed)
-			report.ChangedFiles = appendUntracked(report.ChangedFiles, workingFiles)
+		changed, err := gitBytes(ctx, record.Directory, "diff", "--name-status", "-z", "--no-renames", baseCommit)
+		if err != nil {
+			return Report{}, true, err
+		}
+		report.ChangedFiles = parseDiffStatus(changed)
+		report.ChangedFiles = appendUntracked(report.ChangedFiles, workingFiles)
+		if !unborn || greenfield {
 			var logOutput string
+			var logErr error
 			if greenfield {
-				logOutput, err = gitOutput(ctx, record.Directory, "log", "--format=%H%x09%aI%x09%s", "--all")
+				logOutput, logErr = gitOutput(ctx, record.Directory, "log", "--format=%H%x09%aI%x09%s", "--all")
 			} else {
-				logOutput, err = gitOutput(ctx, record.Directory, "log", "--format=%H%x09%aI%x09%s", baseCommit+"..HEAD")
+				logOutput, logErr = gitOutput(ctx, record.Directory, "log", "--format=%H%x09%aI%x09%s", baseCommit+"..HEAD")
 			}
-			if err != nil {
-				return Report{}, true, err
+			if logErr != nil {
+				return Report{}, true, logErr
 			}
 			report.Commits = parseCommits(logOutput)
 			report.CommitCount = len(report.Commits)
-			stat, err := gitOutput(ctx, record.Directory, "diff", "--stat", "--no-ext-diff", baseCommit)
-			if err != nil {
-				return Report{}, true, err
-			}
-			report.DiffStat = strings.TrimSpace(stat)
-		} else {
-			report.ChangedFiles = workingFiles
 		}
+		stat, err := gitOutput(ctx, record.Directory, "diff", "--stat", "--no-ext-diff", baseCommit)
+		if err != nil {
+			return Report{}, true, err
+		}
+		report.DiffStat = strings.TrimSpace(stat)
 	} else {
 		report.ChangedFiles = workingFiles
 	}
 	report.ChangedFileCount = len(report.ChangedFiles)
 	if greenfield {
-		report.HasChanges = report.Dirty || report.CommitCount > 0 || (!unborn && report.HeadCommit != "")
+		report.HasChanges = report.Dirty || report.CommitCount > 0 || report.ChangedFileCount > 0 || (!unborn && report.HeadCommit != "")
 	} else {
 		report.HasChanges = report.Dirty || report.HeadCommit != record.BaseCommit
 	}
@@ -345,27 +347,40 @@ func (m *Manager) inspectGit(ctx context.Context, report Report, record Record, 
 }
 
 // discoverGreenfieldGit updates an in-memory greenfield record with live Git
-// metadata and persists newly discovered repository roots when useful.
+// metadata only when the exact target directory is itself a repository root.
 func (m *Manager) discoverGreenfieldGit(ctx context.Context, record *Record) {
 	root, err := gitOutput(ctx, record.Directory, "rev-parse", "--show-toplevel")
 	if err != nil {
 		return
 	}
-	record.RepositoryRoot = strings.TrimSpace(root)
+	root = strings.TrimSpace(root)
+	if !sameFilesystemPath(root, record.Directory) {
+		// Nested under an ancestor repo is not greenfield Git ownership.
+		return
+	}
+	emptyTree, err := ensureEmptyTree(ctx, record.Directory)
+	if err != nil {
+		m.logger.Warn("failed to resolve greenfield empty tree", "session_id", record.SessionID, "err", err)
+		return
+	}
+	record.RepositoryRoot = filepath.Clean(root)
 	if record.BaseCommit == "" {
-		record.BaseCommit = emptyTreeID
+		record.BaseCommit = emptyTree
 	}
 	m.mu.Lock()
 	current, ok := m.records[record.SessionID]
 	if ok && current.CleanedAt.IsZero() {
+		changed := current.RepositoryRoot != record.RepositoryRoot || current.BaseCommit != record.BaseCommit
 		current.RepositoryRoot = record.RepositoryRoot
 		if current.BaseCommit == "" {
-			current.BaseCommit = emptyTreeID
+			current.BaseCommit = emptyTree
 		}
 		m.records[record.SessionID] = current
 		m.mu.Unlock()
-		if err := m.save(current); err != nil {
-			m.logger.Warn("failed to persist greenfield git discovery", "session_id", record.SessionID, "err", err)
+		if changed {
+			if err := m.save(current); err != nil {
+				m.logger.Warn("failed to persist greenfield git discovery", "session_id", record.SessionID, "err", err)
+			}
 		}
 		return
 	}
@@ -382,12 +397,6 @@ func (m *Manager) Diff(ctx context.Context, sessionID string, maxChars int) (Dif
 	}
 	if !report.Available || report.BaseCommit == "" {
 		return Diff{}, fmt.Errorf("workspace for session %s has no available Git checkout", sessionID)
-	}
-	if report.Mode == ModeGreenfield && report.HeadCommit == "" {
-		return Diff{
-			SessionID:  sessionID,
-			BaseCommit: report.BaseCommit,
-		}, nil
 	}
 	if maxChars <= 0 {
 		maxChars = defaultOutputLimit
@@ -505,27 +514,25 @@ func (m *Manager) cleanupWorktree(ctx context.Context, sessionID string, report 
 }
 
 func (m *Manager) cleanupGreenfield(sessionID string, report Report, force bool) (CleanupResult, error) {
-	if !report.Owned {
-		return CleanupResult{Record: report.Record}, errors.New("workspace is not executor-owned")
-	}
-	if err := m.validateOwnedGreenfieldPath(report.Directory); err != nil {
+	path, err := validateOwnedGreenfieldRecord(report.Record)
+	if err != nil {
 		return CleanupResult{}, err
 	}
-	info, err := os.Lstat(report.Directory)
+	info, err := os.Lstat(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return m.markCleaned(sessionID, report.Record)
 		}
 		return CleanupResult{}, fmt.Errorf("inspect greenfield directory: %w", err)
 	}
-	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return CleanupResult{}, fmt.Errorf("refusing to remove non-directory greenfield path %q", report.Directory)
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return CleanupResult{}, fmt.Errorf("refusing to remove non-directory greenfield path %q", path)
 	}
 	if !force {
 		if report.HasChanges || report.CommitCount > 0 {
 			return CleanupResult{}, errors.New("workspace has files, Git changes, or commits; pass force=true to discard them")
 		}
-		empty, err := directoryEmpty(report.Directory)
+		empty, err := directoryEmpty(path)
 		if err != nil {
 			return CleanupResult{}, err
 		}
@@ -533,7 +540,7 @@ func (m *Manager) cleanupGreenfield(sessionID string, report Report, force bool)
 			return CleanupResult{}, errors.New("workspace has files, Git changes, or commits; pass force=true to discard them")
 		}
 	}
-	if err := os.RemoveAll(report.Directory); err != nil {
+	if err := os.RemoveAll(path); err != nil {
 		return CleanupResult{}, fmt.Errorf("remove greenfield directory: %w", err)
 	}
 	return m.markCleaned(sessionID, report.Record)
@@ -581,8 +588,8 @@ func (m *Manager) sourceDirectory(directory string) (string, error) {
 }
 
 // prepareGreenfield creates an executor-owned target directory that does not
-// yet exist. The parent must already be a real directory; the final path
-// component must not exist (including as a symlink).
+// yet exist. The parent must already be a real directory (not a symlink); the
+// final path component must not exist (including as a symlink).
 func (m *Manager) prepareGreenfield(directory string) (Record, error) {
 	directory = strings.TrimSpace(directory)
 	if directory == "" {
@@ -594,9 +601,12 @@ func (m *Manager) prepareGreenfield(directory string) (Record, error) {
 	}
 	absolute = filepath.Clean(absolute)
 	parent := filepath.Dir(absolute)
-	parentInfo, err := os.Stat(parent)
+	parentInfo, err := os.Lstat(parent)
 	if err != nil {
 		return Record{}, fmt.Errorf("inspect greenfield parent directory: %w", err)
+	}
+	if parentInfo.Mode()&os.ModeSymlink != 0 {
+		return Record{}, fmt.Errorf("greenfield parent path %q is a symlink", parent)
 	}
 	if !parentInfo.IsDir() {
 		return Record{}, fmt.Errorf("greenfield parent path %q is not a directory", parent)
@@ -716,11 +726,20 @@ func (m *Manager) rollback(record Record) {
 			m.logger.Warn("failed to roll back worktree", "directory", record.WorktreeRoot, "remove_error", removeErr, "branch_error", branchErr)
 		}
 	case ModeGreenfield:
-		if !record.Owned || m.validateOwnedGreenfieldPath(record.Directory) != nil {
+		path, err := validateOwnedGreenfieldRecord(record)
+		if err != nil {
 			return
 		}
-		if err := os.RemoveAll(record.Directory); err != nil {
-			m.logger.Warn("failed to roll back greenfield directory", "directory", record.Directory, "err", err)
+		info, err := os.Lstat(path)
+		if err != nil {
+			return
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			m.logger.Warn("refusing to roll back non-directory greenfield path", "directory", path)
+			return
+		}
+		if err := os.RemoveAll(path); err != nil {
+			m.logger.Warn("failed to roll back greenfield directory", "directory", path, "err", err)
 		}
 	}
 }
@@ -740,19 +759,56 @@ func (m *Manager) validateOwnedPath(path string) error {
 	return nil
 }
 
-func (m *Manager) validateOwnedGreenfieldPath(path string) error {
-	if strings.TrimSpace(path) == "" {
-		return errors.New("greenfield directory is not set")
+// validateOwnedGreenfieldRecord ensures executor-owned greenfield cleanup and
+// rollback only touch the exact absolute cleaned path recorded at creation.
+func validateOwnedGreenfieldRecord(record Record) (string, error) {
+	if record.Mode != ModeGreenfield || !record.Owned {
+		return "", errors.New("workspace is not an executor-owned greenfield directory")
 	}
-	absolute, err := filepath.Abs(path)
+	directory := record.Directory
+	source := record.SourceDirectory
+	if strings.TrimSpace(directory) == "" || strings.TrimSpace(source) == "" {
+		return "", errors.New("greenfield directory is not set")
+	}
+	if directory != source {
+		return "", fmt.Errorf("greenfield source_directory and directory disagree")
+	}
+	if !filepath.IsAbs(directory) {
+		return "", fmt.Errorf("greenfield directory must be absolute: %q", directory)
+	}
+	cleaned := filepath.Clean(directory)
+	if cleaned != directory {
+		return "", fmt.Errorf("greenfield directory must be a cleaned absolute path: %q", directory)
+	}
+	if cleaned == string(filepath.Separator) || cleaned == "." || cleaned == ".." {
+		return "", fmt.Errorf("refusing to remove unsafe greenfield path %q", directory)
+	}
+	return cleaned, nil
+}
+
+// ensureEmptyTree writes the empty tree object for the repository's object
+// format and returns its object ID for use as a synthetic greenfield base.
+func ensureEmptyTree(ctx context.Context, directory string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", "-C", directory, "hash-object", "-w", "-t", "tree", "--stdin")
+	cmd.Stdin = bytes.NewReader(nil)
+	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return err
+		return "", fmt.Errorf("resolve empty tree: %w: %s", err, strings.TrimSpace(string(output)))
 	}
-	absolute = filepath.Clean(absolute)
-	if absolute == string(filepath.Separator) || absolute == "." || absolute == ".." {
-		return fmt.Errorf("refusing to remove unsafe greenfield path %q", path)
+	oid := strings.TrimSpace(string(output))
+	if oid == "" {
+		return "", errors.New("resolve empty tree: empty object id")
 	}
-	return nil
+	return oid, nil
+}
+
+func sameFilesystemPath(a, b string) bool {
+	aAbs, aErr := filepath.Abs(a)
+	bAbs, bErr := filepath.Abs(b)
+	if aErr != nil || bErr != nil {
+		return filepath.Clean(a) == filepath.Clean(b)
+	}
+	return filepath.Clean(aAbs) == filepath.Clean(bAbs)
 }
 
 func directoryEmpty(path string) (bool, error) {
