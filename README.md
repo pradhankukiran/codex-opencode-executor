@@ -328,8 +328,6 @@ the managed local OpenCode process.
   that snapshot predates the endpoint.
 - Full diffs cover tracked files. Workspace reports include untracked file names,
   but not their contents.
-- Managed local server startup does not yet perform a readiness handshake before
-  the first request.
 - Automated end-to-end coverage against real provider subscriptions is still in
   progress; local tests use isolated Git repositories and OpenCode server fakes.
 

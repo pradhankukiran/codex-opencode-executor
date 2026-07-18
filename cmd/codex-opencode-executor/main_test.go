@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -12,14 +14,16 @@ import (
 	"github.com/pradhankukiran/codex-opencode-executor/internal/tools/opencode"
 )
 
-func TestWaitForTCP(t *testing.T) {
-	t.Run("listener ready", func(t *testing.T) {
-		listener, err := net.Listen("tcp", "127.0.0.1:0")
-		require.NoError(t, err)
-		t.Cleanup(func() { _ = listener.Close() })
+func TestWaitForHTTP(t *testing.T) {
+	t.Run("HTTP ready", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			require.Equal(t, "/global/health", r.URL.Path)
+			w.WriteHeader(http.StatusUnauthorized)
+		}))
+		t.Cleanup(server.Close)
 
 		done := make(chan error, 1)
-		err = waitForTCP(t.Context(), "http://"+listener.Addr().String(), done, time.Second)
+		err := waitForHTTP(t.Context(), server.URL, done, time.Second)
 		require.NoError(t, err)
 	})
 
@@ -31,7 +35,7 @@ func TestWaitForTCP(t *testing.T) {
 
 		done := make(chan error, 1)
 		done <- errors.New("startup failed")
-		err = waitForTCP(t.Context(), "http://"+address, done, time.Second)
+		err = waitForHTTP(t.Context(), "http://"+address, done, time.Second)
 		require.EqualError(t, err, "opencode serve exited before accepting connections: startup failed")
 		require.EqualError(t, <-done, "startup failed")
 	})
@@ -44,8 +48,17 @@ func TestWaitForTCP(t *testing.T) {
 
 		ctx, cancel := context.WithCancel(t.Context())
 		cancel()
-		err = waitForTCP(ctx, "http://"+address, make(chan error, 1), time.Second)
+		err = waitForHTTP(ctx, "http://"+address, make(chan error, 1), time.Second)
 		require.ErrorIs(t, err, context.Canceled)
+	})
+
+	t.Run("TCP without HTTP times out", func(t *testing.T) {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = listener.Close() })
+
+		err = waitForHTTP(t.Context(), "http://"+listener.Addr().String(), make(chan error, 1), 50*time.Millisecond)
+		require.ErrorContains(t, err, "timed out after 50ms")
 	})
 }
 

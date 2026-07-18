@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
@@ -331,7 +332,7 @@ func (o *opencodeCfg) startLocal(ctx context.Context, defaultBaseURL string, lg 
 			<-done
 		}
 	}
-	if err := waitForTCP(ctx, baseURL, done, localStartupTimeout); err != nil {
+	if err := waitForHTTP(ctx, baseURL, done, localStartupTimeout); err != nil {
 		stop()
 		return "", func() {}, fmt.Errorf("wait for opencode serve: %w", err)
 	}
@@ -339,7 +340,7 @@ func (o *opencodeCfg) startLocal(ctx context.Context, defaultBaseURL string, lg 
 	return baseURL, stop, nil
 }
 
-func waitForTCP(ctx context.Context, baseURL string, processDone chan error, timeout time.Duration) error {
+func waitForHTTP(ctx context.Context, baseURL string, processDone chan error, timeout time.Duration) error {
 	parsed, err := url.Parse(baseURL)
 	if err != nil {
 		return fmt.Errorf("parse server URL: %w", err)
@@ -351,16 +352,22 @@ func waitForTCP(ctx context.Context, baseURL string, processDone chan error, tim
 	if _, _, err := net.SplitHostPort(address); err != nil {
 		return fmt.Errorf("server URL %q must include a port: %w", baseURL, err)
 	}
+	parsed.Path = strings.TrimRight(parsed.Path, "/") + "/global/health"
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
 
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
+	readyCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	client := &http.Client{Timeout: 500 * time.Millisecond}
 	var lastErr error
 	for {
-		connection, err := net.DialTimeout("tcp", address, 250*time.Millisecond)
+		request, err := http.NewRequestWithContext(readyCtx, http.MethodGet, parsed.String(), nil)
+		if err != nil {
+			return err
+		}
+		response, err := client.Do(request)
 		if err == nil {
-			_ = connection.Close()
+			_ = response.Body.Close()
 			return nil
 		}
 		lastErr = err
@@ -373,9 +380,9 @@ func waitForTCP(ctx context.Context, baseURL string, processDone chan error, tim
 			return fmt.Errorf("opencode serve exited before accepting connections: %w", processErr)
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-timer.C:
+		case <-readyCtx.Done():
 			return fmt.Errorf("timed out after %s: %w", timeout, lastErr)
-		case <-ticker.C:
+		case <-time.After(100 * time.Millisecond):
 		}
 	}
 }

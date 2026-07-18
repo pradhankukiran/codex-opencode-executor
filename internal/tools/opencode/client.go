@@ -94,24 +94,32 @@ func (c *Client) SyncTimeout() time.Duration {
 }
 
 func (c *Client) Health(ctx context.Context) (json.RawMessage, error) {
-	res, err := c.apiClient.V2HealthGet(ctx)
-	if err != nil {
-		return nil, err
-	}
-	switch r := res.(type) {
-	case *api.V2HealthGetOK:
-		raw, err := json.Marshal(r)
+	for _, route := range []string{"/global/health", "/api/health"} {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+route, nil)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("create health request: %w", err)
 		}
-		return json.RawMessage(raw), nil
-	case *api.InvalidRequestError:
-		return nil, fmt.Errorf("invalid request: %s", r.Message)
-	case *api.UnauthorizedError:
-		return nil, fmt.Errorf("unauthorized: %s", r.Message)
-	default:
-		return nil, fmt.Errorf("unexpected health response type: %T", res)
+		res, err := c.httpClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("GET %s: %w", route, err)
+		}
+		body, readErr := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+		_ = res.Body.Close()
+		if readErr != nil {
+			return nil, fmt.Errorf("read health response: %w", readErr)
+		}
+		if res.StatusCode == http.StatusNotFound {
+			continue
+		}
+		if res.StatusCode < http.StatusOK || res.StatusCode >= http.StatusMultipleChoices {
+			return nil, fmt.Errorf("GET %s: status %s: %s", route, res.Status, strings.TrimSpace(string(body)))
+		}
+		if !json.Valid(body) {
+			return nil, fmt.Errorf("GET %s returned invalid JSON", route)
+		}
+		return json.RawMessage(body), nil
 	}
+	return nil, errors.New("opencode health endpoint was not found")
 }
 
 func (c *Client) Agents(ctx context.Context, loc Location) ([]Agent, error) {

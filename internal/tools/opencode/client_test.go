@@ -40,6 +40,45 @@ func TestClientTimeout(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestClientHealthUsesGlobalRouteWithLegacyFallback(t *testing.T) {
+	t.Parallel()
+
+	t.Run("global", func(t *testing.T) {
+		var paths []string
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			paths = append(paths, r.URL.Path)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"healthy":true,"version":"1.18.3"}`))
+		}))
+		t.Cleanup(server.Close)
+
+		client := newTestClient(t, Config{BaseURL: server.URL})
+		health, err := client.Health(t.Context())
+		require.NoError(t, err)
+		require.JSONEq(t, `{"healthy":true,"version":"1.18.3"}`, string(health))
+		require.Equal(t, []string{"/global/health"}, paths)
+	})
+
+	t.Run("legacy fallback", func(t *testing.T) {
+		var paths []string
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			paths = append(paths, r.URL.Path)
+			if r.URL.Path == "/global/health" {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"healthy":true}`))
+		}))
+		t.Cleanup(server.Close)
+
+		client := newTestClient(t, Config{BaseURL: server.URL})
+		_, err := client.Health(t.Context())
+		require.NoError(t, err)
+		require.Equal(t, []string{"/global/health", "/api/health"}, paths)
+	})
+}
+
 func TestClientPromptUsesSyncTimeout(t *testing.T) {
 	t.Parallel()
 
