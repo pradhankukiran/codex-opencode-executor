@@ -261,11 +261,16 @@ func (m *Manager) Inspect(ctx context.Context, sessionID string) (Report, bool, 
 	if err != nil {
 		return Report{}, true, err
 	}
-	report.ChangedFiles = parseStatus(status)
-	report.ChangedFileCount = len(report.ChangedFiles)
-	report.Dirty = len(report.ChangedFiles) > 0
+	workingFiles := parseStatus(status)
+	report.Dirty = len(workingFiles) > 0
 
 	if record.BaseCommit != "" {
+		changed, err := gitBytes(ctx, record.Directory, "diff", "--name-status", "-z", "--no-renames", record.BaseCommit)
+		if err != nil {
+			return Report{}, true, err
+		}
+		report.ChangedFiles = parseDiffStatus(changed)
+		report.ChangedFiles = appendUntracked(report.ChangedFiles, workingFiles)
 		logOutput, err := gitOutput(ctx, record.Directory, "log", "--format=%H%x09%aI%x09%s", record.BaseCommit+"..HEAD")
 		if err != nil {
 			return Report{}, true, err
@@ -277,7 +282,10 @@ func (m *Manager) Inspect(ctx context.Context, sessionID string) (Report, bool, 
 			return Report{}, true, err
 		}
 		report.DiffStat = strings.TrimSpace(stat)
+	} else {
+		report.ChangedFiles = workingFiles
 	}
+	report.ChangedFileCount = len(report.ChangedFiles)
 	report.HasChanges = report.Dirty || report.HeadCommit != record.BaseCommit
 	return report, true, nil
 }
@@ -689,6 +697,36 @@ func parseStatus(data []byte) []ChangedFile {
 		files = append(files, changed)
 	}
 	return files
+}
+
+func parseDiffStatus(data []byte) []ChangedFile {
+	fields := bytes.Split(data, []byte{0})
+	files := make([]ChangedFile, 0, len(fields)/2)
+	for index := 0; index+1 < len(fields); index += 2 {
+		if len(fields[index]) == 0 || len(fields[index+1]) == 0 {
+			continue
+		}
+		files = append(files, ChangedFile{Status: string(fields[index]), Path: string(fields[index+1])})
+	}
+	return files
+}
+
+func appendUntracked(changed, working []ChangedFile) []ChangedFile {
+	paths := make(map[string]struct{}, len(changed))
+	for _, file := range changed {
+		paths[file.Path] = struct{}{}
+	}
+	for _, file := range working {
+		if file.Status != "??" {
+			continue
+		}
+		if _, exists := paths[file.Path]; exists {
+			continue
+		}
+		changed = append(changed, file)
+		paths[file.Path] = struct{}{}
+	}
+	return changed
 }
 
 func parseCommits(output string) []Commit {

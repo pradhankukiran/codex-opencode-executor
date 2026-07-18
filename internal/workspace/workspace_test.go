@@ -44,7 +44,7 @@ func TestManagerWorktreeLifecycle(t *testing.T) {
 	require.True(t, report.HasChanges)
 	require.Equal(t, 2, report.ChangedFileCount)
 	require.ElementsMatch(t, []ChangedFile{
-		{Status: " M", Path: "tracked.txt"},
+		{Status: "M", Path: "tracked.txt"},
 		{Status: "??", Path: "new.txt"},
 	}, report.ChangedFiles)
 	require.Contains(t, report.DiffStat, "tracked.txt")
@@ -102,6 +102,8 @@ func TestManagerTracksCommits(t *testing.T) {
 	require.True(t, report.HasChanges)
 	require.Len(t, report.Commits, 1)
 	require.Equal(t, 1, report.CommitCount)
+	require.Equal(t, []ChangedFile{{Status: "M", Path: "tracked.txt"}}, report.ChangedFiles)
+	require.Equal(t, 1, report.ChangedFileCount)
 	require.Equal(t, "executor change", report.Commits[0].Subject)
 	require.NotEqual(t, report.BaseCommit, report.HeadCommit)
 }
