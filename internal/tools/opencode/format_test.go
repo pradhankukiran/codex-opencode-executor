@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/require"
 )
@@ -213,4 +214,79 @@ func TestMessageSummaryUsesNestedInfoRole(t *testing.T) {
 	require.Len(t, msgs, 2)
 	require.Equal(t, MessageSummary{ID: "msg_1", Role: "user", Text: "hello"}, msgs[0])
 	require.Equal(t, MessageSummary{ID: "msg_2", Role: "assistant", Text: "done"}, msgs[1])
+}
+
+func TestTruncateTextMarkedRuneSafe(t *testing.T) {
+	t.Parallel()
+
+	// 10 multibyte runes: each "界" is 3 bytes; byte length 30, rune length 10.
+	multibyte := strings.Repeat("界", 10)
+
+	t.Run("under character limit keeps full multibyte string", func(t *testing.T) {
+		t.Parallel()
+		// Byte length (30) exceeds a naive byte limit of 20, but rune count is 10.
+		got, truncated := truncateTextMarked(multibyte, 20)
+		require.False(t, truncated)
+		require.Equal(t, multibyte, got)
+		require.True(t, utf8.ValidString(got))
+	})
+
+	t.Run("truncates on rune boundary without splitting UTF-8", func(t *testing.T) {
+		t.Parallel()
+		got, truncated := truncateTextMarked(multibyte, 4)
+		require.True(t, truncated)
+		require.Equal(t, strings.Repeat("界", 4)+"...", got)
+		require.True(t, utf8.ValidString(got))
+		require.Equal(t, 4, utf8.RuneCountInString(strings.TrimSuffix(got, "...")))
+	})
+
+	t.Run("exact rune limit is not truncated", func(t *testing.T) {
+		t.Parallel()
+		got, truncated := truncateTextMarked(multibyte, 10)
+		require.False(t, truncated)
+		require.Equal(t, multibyte, got)
+	})
+
+	t.Run("mixed ascii and multibyte", func(t *testing.T) {
+		t.Parallel()
+		// "hi" (2) + 3×"界" (3) + "!" (1) = 6 runes; bytes > 6.
+		s := "hi" + strings.Repeat("界", 3) + "!"
+		got, truncated := truncateTextMarked(s, 4)
+		require.True(t, truncated)
+		require.Equal(t, "hi界界...", got)
+		require.True(t, utf8.ValidString(got))
+	})
+}
+
+func TestShapeHandoffCheckFinalTextMultibyteCap(t *testing.T) {
+	t.Parallel()
+	// 50×"界" = 50 runes / 150 bytes: under max_final_chars=100 must not truncate.
+	answer := strings.Repeat("界", 50)
+	msg := json.RawMessage(`[
+	  {"info":{"id":"u","role":"user"},"parts":[{"type":"text","text":"go"}]},
+	  {"info":{"id":"a","role":"assistant","finish":"stop"},"parts":[{"type":"text","text":` + mustJSONString(answer) + `}]}
+	]`)
+	res := shapeHandoffCheckResult(HandoffCheckResult{
+		SessionID: "ses-mb",
+		Status:    string(JobDone),
+	}, msg, false, true, 100)
+	require.False(t, res.FinalTextTruncated)
+	require.Equal(t, answer, res.FinalText)
+	require.True(t, utf8.ValidString(res.FinalText))
+
+	res = shapeHandoffCheckResult(HandoffCheckResult{
+		SessionID: "ses-mb-cut",
+		Status:    string(JobDone),
+	}, msg, false, true, 10)
+	require.True(t, res.FinalTextTruncated)
+	require.Equal(t, strings.Repeat("界", 10)+"...", res.FinalText)
+	require.True(t, utf8.ValidString(res.FinalText))
+}
+
+func mustJSONString(s string) string {
+	b, err := json.Marshal(s)
+	if err != nil {
+		panic(err)
+	}
+	return string(b)
 }

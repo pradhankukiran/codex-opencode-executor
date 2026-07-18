@@ -60,9 +60,15 @@ func Register(s *mcp.Server, client *Client, mgr *Manager, workspaces *workspace
 
 	mcputil.Register(s, mcputil.ToolDef{
 		Name:        "handoff_check",
-		Description: "Poll progress for a session_id returned by handoff_fire, or inspect sessions for pending permissions/questions.",
+		Description: "Poll progress for a session_id from handoff_fire. Omits workspace data by default; set include_workspace=true to attach a compact report. final_text is terminal-only and bounded (default 1200 chars).",
 		Flags:       mcputil.ReadOnly,
 	}, checkHandler(client, mgr, workspaces))
+
+	mcputil.Register(s, mcputil.ToolDef{
+		Name:        "handoff_review",
+		Description: "Compact read-only review of a session workspace: changed files, commits, diff stat, and verification status without paths/metadata or diffs.",
+		Flags:       mcputil.ReadOnly,
+	}, reviewHandler(workspaces))
 
 	mcputil.Register(s, mcputil.ToolDef{
 		Name:        "handoff_cancel",
@@ -400,13 +406,18 @@ func submitOptions(args fireParams) (SubmitOptions, error) {
 
 type checkParams struct {
 	locationParams
-	SessionID   string `json:"session_id" jsonschema:"opencode session id."`
-	Verbose     bool   `json:"verbose,omitempty" jsonschema:"Include bounded raw messages for diagnostics. Default omits messages. final_text is only set for completed assistant answers, never for in-progress polls."`
-	WaitSeconds int    `json:"wait_seconds,omitempty" jsonschema:"Max seconds to wait for completion (0-300). 0 = no wait."`
+	SessionID        string `json:"session_id" jsonschema:"opencode session id."`
+	Verbose          bool   `json:"verbose,omitempty" jsonschema:"Include bounded raw messages for diagnostics. Default omits messages."`
+	WaitSeconds      int    `json:"wait_seconds,omitempty" jsonschema:"Max seconds to wait for completion (0-300). 0 = no wait."`
+	IncludeWorkspace bool   `json:"include_workspace,omitempty" jsonschema:"Attach a compact workspace report. Default omits workspace data."`
+	MaxFinalChars    int    `json:"max_final_chars,omitempty" jsonschema:"Max final_text characters. Default 1200; maximum 4000."`
 }
 
 func checkHandler(client *Client, mgr *Manager, workspaces *workspace.Manager) mcp.ToolHandlerFor[checkParams, HandoffCheckResult] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, args checkParams) (*mcp.CallToolResult, HandoffCheckResult, error) {
+		if _, err := boundedLimit("max_final_chars", args.MaxFinalChars, defaultFinalTextChars, maxFinalTextChars); err != nil {
+			return nil, HandoffCheckResult{}, err
+		}
 		loc := sessionLocation(workspaces, args.SessionID, args.location())
 		if args.WaitSeconds > 0 {
 			waitCtx, cancel := context.WithTimeout(ctx, time.Duration(min(args.WaitSeconds, 300))*time.Second)
@@ -416,7 +427,7 @@ func checkHandler(client *Client, mgr *Manager, workspaces *workspace.Manager) m
 
 		args.Directory = loc.Directory
 		res, err := doCheck(ctx, client, mgr, args)
-		if err == nil && workspaces != nil {
+		if err == nil && args.IncludeWorkspace && workspaces != nil {
 			report, ok, inspectErr := workspaces.Inspect(ctx, args.SessionID)
 			if inspectErr != nil {
 				res.WorkspaceError = inspectErr.Error()
@@ -483,11 +494,16 @@ func doCheck(ctx context.Context, client *Client, mgr *Manager, args checkParams
 		return HandoffCheckResult{}, err
 	}
 
+	maxFinalChars, err := boundedLimit("max_final_chars", args.MaxFinalChars, defaultFinalTextChars, maxFinalTextChars)
+	if err != nil {
+		return HandoffCheckResult{}, err
+	}
+
 	// No tracked job (external session or different server instance): report
 	// whatever opencode says and surface any pending permissions/questions.
 	if !tracked {
 		res.Status = sessionStatus(isFinished)
-		return shapeHandoffCheckResult(res, msg, args.Verbose, isFinished), nil
+		return shapeHandoffCheckResult(res, msg, args.Verbose, isFinished, maxFinalChars), nil
 	}
 
 	job, _ := mgr.Reconcile(args.SessionID, isFinished)
@@ -503,7 +519,72 @@ func doCheck(ctx context.Context, client *Client, mgr *Manager, args checkParams
 	if status != JobRunning && job.Err != nil {
 		res.JobError = job.Err.Error()
 	}
-	return shapeHandoffCheckResult(res, msg, args.Verbose, isFinished), nil
+	return shapeHandoffCheckResult(res, msg, args.Verbose, isFinished, maxFinalChars), nil
+}
+
+type reviewParams struct {
+	SessionID         string `json:"session_id" jsonschema:"opencode session id."`
+	ChangedFileLimit  int    `json:"changed_file_limit,omitempty" jsonschema:"Maximum changed files to return. Defaults to 20; maximum 100."`
+	CommitLimit       int    `json:"commit_limit,omitempty" jsonschema:"Maximum commits to return. Defaults to 10; maximum 50."`
+	VerificationLimit int    `json:"verification_limit,omitempty" jsonschema:"Maximum recent verification results to return. Defaults to 5; maximum 20."`
+}
+
+func reviewHandler(workspaces *workspace.Manager) mcp.ToolHandlerFor[reviewParams, HandoffReviewResult] {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, args reviewParams) (*mcp.CallToolResult, HandoffReviewResult, error) {
+		if workspaces == nil {
+			return nil, HandoffReviewResult{}, fmt.Errorf("workspace management is unavailable")
+		}
+		if strings.TrimSpace(args.SessionID) == "" {
+			return nil, HandoffReviewResult{}, fmt.Errorf("session_id is required")
+		}
+		changedLimit, err := boundedLimit("changed_file_limit", args.ChangedFileLimit, 20, 100)
+		if err != nil {
+			return nil, HandoffReviewResult{}, err
+		}
+		commitLimit, err := boundedLimit("commit_limit", args.CommitLimit, 10, 50)
+		if err != nil {
+			return nil, HandoffReviewResult{}, err
+		}
+		verificationLimit, err := boundedLimit("verification_limit", args.VerificationLimit, 5, 20)
+		if err != nil {
+			return nil, HandoffReviewResult{}, err
+		}
+		report, ok, err := workspaces.Inspect(ctx, args.SessionID)
+		if err != nil {
+			return nil, HandoffReviewResult{}, err
+		}
+		if !ok {
+			return nil, HandoffReviewResult{}, fmt.Errorf("no workspace tracked for session %s", args.SessionID)
+		}
+		return nil, shapeHandoffReview(args.SessionID, report, changedLimit, commitLimit, verificationLimit), nil
+	}
+}
+
+func shapeHandoffReview(sessionID string, report workspace.Report, changedLimit, commitLimit, verificationLimit int) HandoffReviewResult {
+	compactWorkspaceReport(&report, changedLimit, commitLimit, verificationLimit, false)
+	out := HandoffReviewResult{
+		SessionID:        sessionID,
+		Available:        report.Available,
+		Dirty:            report.Dirty,
+		HasChanges:       report.HasChanges,
+		ChangedFileCount: report.ChangedFileCount,
+		ChangedFiles:     report.ChangedFiles,
+		CommitCount:      report.CommitCount,
+		Commits:          report.Commits,
+		DiffStat:         report.DiffStat,
+	}
+	if len(report.Verification) > 0 {
+		out.Verification = make([]ReviewVerification, 0, len(report.Verification))
+		for _, item := range report.Verification {
+			out.Verification = append(out.Verification, ReviewVerification{
+				Name:     item.Name,
+				Command:  item.Command,
+				Status:   item.Status,
+				ExitCode: item.ExitCode,
+			})
+		}
+	}
+	return out
 }
 
 type cancelParams struct {

@@ -126,6 +126,7 @@ type HandoffCheckResult struct {
 	IdempotencyKey     string            `json:"idempotency_key,omitempty"`
 	Deadline           string            `json:"deadline,omitempty"`
 	FinalText          string            `json:"final_text,omitempty"`
+	FinalTextTruncated bool              `json:"final_text_truncated,omitempty"`
 	PendingPermissions []RequestSummary  `json:"pending_permissions,omitempty"`
 	PendingQuestions   []RequestSummary  `json:"pending_questions,omitempty"`
 	JobError           string            `json:"job_error,omitempty"`
@@ -133,6 +134,30 @@ type HandoffCheckResult struct {
 	Messages           []MessageSummary  `json:"messages,omitempty"`
 	Workspace          *workspace.Report `json:"workspace,omitempty"`
 	WorkspaceError     string            `json:"workspace_error,omitempty"`
+}
+
+// HandoffReviewResult is a compact workspace review for a session. It omits
+// full workspace paths/metadata and diffs; use handoff_workspace/handoff_diff
+// for those.
+type HandoffReviewResult struct {
+	SessionID        string                  `json:"session_id"`
+	Available        bool                    `json:"available"`
+	Dirty            bool                    `json:"dirty,omitempty"`
+	HasChanges       bool                    `json:"has_changes,omitempty"`
+	ChangedFileCount int                     `json:"changed_file_count,omitempty"`
+	ChangedFiles     []workspace.ChangedFile `json:"changed_files,omitempty"`
+	CommitCount      int                     `json:"commit_count,omitempty"`
+	Commits          []workspace.Commit      `json:"commits,omitempty"`
+	DiffStat         string                  `json:"diff_stat,omitempty"`
+	Verification     []ReviewVerification    `json:"verification,omitempty"`
+}
+
+// ReviewVerification is a compact verification row without stdout/stderr.
+type ReviewVerification struct {
+	Name     string `json:"name,omitempty"`
+	Command  string `json:"command,omitempty"`
+	Status   string `json:"status,omitempty"`
+	ExitCode int    `json:"exit_code"`
 }
 
 type HandoffCancelResult struct {

@@ -68,6 +68,11 @@ func finalAssistantAnswerText(raw json.RawMessage, requireFinished bool) string 
 	return assistantAnswerText(latest)
 }
 
+const (
+	defaultFinalTextChars = 1200
+	maxFinalTextChars     = 4000
+)
+
 // shapeHandoffCheckResult centralizes handoff_check final_text/messages policy
 // so status and verbosity cannot diverge across checkSession/doCheck callers.
 //
@@ -78,12 +83,18 @@ func finalAssistantAnswerText(raw json.RawMessage, requireFinished bool) string 
 //   - done → final_text only when latest assistant finish is terminal
 //   - error/canceled/timed_out → final_text only when a terminal assistant answer exists
 //   - untracked uses the same rules via status done|running from isFinished
-func shapeHandoffCheckResult(res HandoffCheckResult, msg json.RawMessage, verbose bool, isFinished bool) HandoffCheckResult {
+//   - maxFinalChars bounds final_text (caller-validated; 0 uses default 1200)
+func shapeHandoffCheckResult(res HandoffCheckResult, msg json.RawMessage, verbose bool, isFinished bool, maxFinalChars int) HandoffCheckResult {
 	res.Messages = nil
 	res.FinalText = ""
+	res.FinalTextTruncated = false
 
 	if verbose && len(msg) > 0 {
 		res.Messages = summarizeMessages(msg, 6)
+	}
+
+	if maxFinalChars <= 0 {
+		maxFinalChars = defaultFinalTextChars
 	}
 
 	switch JobStatus(res.Status) {
@@ -93,12 +104,12 @@ func shapeHandoffCheckResult(res HandoffCheckResult, msg json.RawMessage, verbos
 		// Always require a terminal OpenCode assistant finish for final_text,
 		// even when the local Manager already says JobDone (tool-calls race).
 		if len(msg) > 0 {
-			res.FinalText = truncateText(finalAssistantAnswerText(msg, true), 4000)
+			res.FinalText, res.FinalTextTruncated = truncateTextMarked(finalAssistantAnswerText(msg, true), maxFinalChars)
 		}
 		return res
 	default:
 		if isFinished && len(msg) > 0 {
-			res.FinalText = truncateText(finalAssistantAnswerText(msg, true), 4000)
+			res.FinalText, res.FinalTextTruncated = truncateTextMarked(finalAssistantAnswerText(msg, true), maxFinalChars)
 		}
 		return res
 	}
@@ -401,10 +412,25 @@ func compactText(s string) string {
 }
 
 func truncateText(s string, limit int) string {
-	if len(s) <= limit {
-		return s
+	text, _ := truncateTextMarked(s, limit)
+	return text
+}
+
+// truncateTextMarked shortens s to at most limit Unicode code points (runes),
+// appending "..." when shortened. limit is character count, not bytes.
+func truncateTextMarked(s string, limit int) (string, bool) {
+	if limit <= 0 {
+		return s, false
 	}
-	return s[:limit] + "..."
+	// Each rune is at least one byte, so byte length ≤ limit implies no truncation.
+	if len(s) <= limit {
+		return s, false
+	}
+	runes := []rune(s)
+	if len(runes) <= limit {
+		return s, false
+	}
+	return string(runes[:limit]) + "...", true
 }
 
 func truncateFields(s string, limit int) string {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -275,10 +276,11 @@ func TestHandoffCheckResponseShaping(t *testing.T) {
 			SessionID: "ses-error-with-answer",
 			Status:    string(JobError),
 			JobError:  "post-complete side effect failed",
-		}, json.RawMessage(realisticDoneMessages), false, true)
+		}, json.RawMessage(realisticDoneMessages), false, true, 0)
 		require.Equal(t, string(JobError), res.Status)
 		require.Equal(t, "post-complete side effect failed", res.JobError)
 		require.Equal(t, "FINAL ANSWER: Extracted validateToken and updated callers.", res.FinalText)
+		require.False(t, res.FinalTextTruncated)
 		require.Nil(t, res.Messages)
 	})
 
@@ -377,8 +379,81 @@ func TestHandoffCheckResponseShaping(t *testing.T) {
 		})
 		require.Equal(t, string(JobDone), res.Status)
 		require.Equal(t, "FINAL ANSWER: Fixed the race with a wait condition.", res.FinalText)
+		require.False(t, res.FinalTextTruncated)
 		require.Nil(t, res.Messages)
 	})
+
+	t.Run("default max_final_chars truncates long final_text to 1200", func(t *testing.T) {
+		t.Parallel()
+		long := strings.Repeat("x", 1500)
+		messages := longDoneMessages(long)
+		res := checkViaDoCheck(t, checkShapeFixture{
+			sessionID: "ses-truncate-default",
+			tracked:   true,
+			jobStatus: JobDone,
+			messages:  messages,
+		})
+		require.Equal(t, string(JobDone), res.Status)
+		require.True(t, res.FinalTextTruncated)
+		require.Equal(t, strings.Repeat("x", defaultFinalTextChars)+"...", res.FinalText)
+		require.Equal(t, defaultFinalTextChars+3, len(res.FinalText))
+	})
+
+	t.Run("custom max_final_chars truncates to requested bound", func(t *testing.T) {
+		t.Parallel()
+		long := strings.Repeat("y", 200)
+		res := checkViaDoCheck(t, checkShapeFixture{
+			sessionID:     "ses-truncate-custom",
+			tracked:       true,
+			jobStatus:     JobDone,
+			messages:      longDoneMessages(long),
+			maxFinalChars: 50,
+		})
+		require.True(t, res.FinalTextTruncated)
+		require.Equal(t, strings.Repeat("y", 50)+"...", res.FinalText)
+	})
+
+	t.Run("max_final_chars within limit does not truncate", func(t *testing.T) {
+		t.Parallel()
+		res := checkViaDoCheck(t, checkShapeFixture{
+			sessionID:     "ses-no-truncate",
+			tracked:       true,
+			jobStatus:     JobDone,
+			messages:      realisticDoneMessages,
+			maxFinalChars: 4000,
+		})
+		require.False(t, res.FinalTextTruncated)
+		require.Equal(t, "FINAL ANSWER: Extracted validateToken and updated callers.", res.FinalText)
+	})
+
+	t.Run("running never truncates or sets final_text even with tiny max", func(t *testing.T) {
+		t.Parallel()
+		res := checkViaDoCheck(t, checkShapeFixture{
+			sessionID:     "ses-running-tiny-max",
+			tracked:       true,
+			jobStatus:     JobRunning,
+			messages:      realisticRunningMessages,
+			maxFinalChars: 10,
+		})
+		require.Equal(t, string(JobRunning), res.Status)
+		require.Empty(t, res.FinalText)
+		require.False(t, res.FinalTextTruncated)
+	})
+}
+
+func longDoneMessages(final string) string {
+	return `[
+  {"info":{"id":"msg_user_01","role":"user"},"parts":[{"type":"text","text":"go"}]},
+  {"info":{"id":"msg_asst_01","role":"assistant","finish":"stop"},"parts":[{"type":"text","text":` + jsonString(final) + `}]}
+]`
+}
+
+func jsonString(s string) string {
+	b, err := json.Marshal(s)
+	if err != nil {
+		panic(err)
+	}
+	return string(b)
 }
 
 func TestFinalAssistantAnswerText(t *testing.T) {
@@ -424,13 +499,14 @@ func TestIsTerminalFinish(t *testing.T) {
 }
 
 type checkShapeFixture struct {
-	sessionID string
-	tracked   bool
-	jobStatus JobStatus
-	jobErr    error
-	messages  string
-	context   string // retained for fixture realism; check path no longer uses context for final_text
-	verbose   bool
+	sessionID     string
+	tracked       bool
+	jobStatus     JobStatus
+	jobErr        error
+	messages      string
+	context       string // retained for fixture realism; check path no longer uses context for final_text
+	verbose       bool
+	maxFinalChars int
 }
 
 func checkViaDoCheck(t *testing.T, fix checkShapeFixture) HandoffCheckResult {
@@ -472,8 +548,9 @@ func checkViaDoCheck(t *testing.T, fix checkShapeFixture) HandoffCheckResult {
 	}
 
 	res, err := doCheck(t.Context(), client, mgr, checkParams{
-		SessionID: fix.sessionID,
-		Verbose:   fix.verbose,
+		SessionID:     fix.sessionID,
+		Verbose:       fix.verbose,
+		MaxFinalChars: fix.maxFinalChars,
 	})
 	require.NoError(t, err)
 

@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -181,6 +182,176 @@ func TestWorkspaceActionsRejectActiveJob(t *testing.T) {
 	mgr := NewManager(t.Context(), nil, ManagerOptions{})
 	mgr.jobs["session-active"] = &Job{SessionID: "session-active", Status: JobRunning}
 	require.EqualError(t, requireInactiveJob(mgr, "session-active", "verify"), "cannot verify workspace while session session-active has an active job")
+}
+
+func TestHandoffCheckWorkspaceOptIn(t *testing.T) {
+	repository := t.TempDir()
+	runGit(t, repository, "init")
+	runGit(t, repository, "config", "user.name", "Test User")
+	runGit(t, repository, "config", "user.email", "test@example.com")
+	require.NoError(t, os.WriteFile(filepath.Join(repository, "file.txt"), []byte("base\n"), 0o600))
+	runGit(t, repository, "add", "file.txt")
+	runGit(t, repository, "commit", "-m", "base")
+
+	workspaces, err := workspace.NewManager(workspace.Options{
+		StateDir:    filepath.Join(t.TempDir(), "state"),
+		WorktreeDir: filepath.Join(t.TempDir(), "worktrees"),
+		DefaultMode: workspace.ModeAuto,
+	})
+	require.NoError(t, err)
+	record, err := workspaces.Open(t.Context(), workspace.OpenOptions{Directory: repository}, func(context.Context, string) (string, error) {
+		return "ses-check-ws", nil
+	})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(record.Directory, "file.txt"), []byte("changed\n"), 0o600))
+
+	handler := &HandlerMock{
+		SessionMessagesFunc: func(context.Context, opencodeapi.SessionMessagesParams) (opencodeapi.SessionMessagesRes, error) {
+			var resp opencodeapi.SessionMessagesOKApplicationJSON
+			require.NoError(t, json.Unmarshal([]byte(realisticDoneMessages), &resp))
+			return &resp, nil
+		},
+		V2PermissionRequestListFunc: func(context.Context, opencodeapi.V2PermissionRequestListParams) (opencodeapi.V2PermissionRequestListRes, error) {
+			return &opencodeapi.V2PermissionRequestListOK{Data: []opencodeapi.PermissionV2Request{}}, nil
+		},
+		V2QuestionRequestListFunc: func(context.Context, opencodeapi.V2QuestionRequestListParams) (opencodeapi.V2QuestionRequestListRes, error) {
+			return &opencodeapi.V2QuestionRequestListOK{Data: []opencodeapi.QuestionV2Request{}}, nil
+		},
+	}
+	client := setupTestServer(t, handler)
+	mgr := NewManager(t.Context(), client, ManagerOptions{})
+	h := checkHandler(client, mgr, workspaces)
+
+	_, defaultRes, err := h(t.Context(), nil, checkParams{SessionID: "ses-check-ws"})
+	require.NoError(t, err)
+	require.Nil(t, defaultRes.Workspace)
+	require.Empty(t, defaultRes.WorkspaceError)
+
+	_, withWS, err := h(t.Context(), nil, checkParams{SessionID: "ses-check-ws", IncludeWorkspace: true})
+	require.NoError(t, err)
+	require.NotNil(t, withWS.Workspace)
+	require.True(t, withWS.Workspace.HasChanges)
+	require.Equal(t, 1, withWS.Workspace.ChangedFileCount)
+}
+
+func TestHandoffCheckMaxFinalCharsValidation(t *testing.T) {
+	handler := &HandlerMock{
+		SessionMessagesFunc: func(context.Context, opencodeapi.SessionMessagesParams) (opencodeapi.SessionMessagesRes, error) {
+			var resp opencodeapi.SessionMessagesOKApplicationJSON
+			require.NoError(t, json.Unmarshal([]byte(realisticDoneMessages), &resp))
+			return &resp, nil
+		},
+		V2PermissionRequestListFunc: func(context.Context, opencodeapi.V2PermissionRequestListParams) (opencodeapi.V2PermissionRequestListRes, error) {
+			return &opencodeapi.V2PermissionRequestListOK{Data: []opencodeapi.PermissionV2Request{}}, nil
+		},
+		V2QuestionRequestListFunc: func(context.Context, opencodeapi.V2QuestionRequestListParams) (opencodeapi.V2QuestionRequestListRes, error) {
+			return &opencodeapi.V2QuestionRequestListOK{Data: []opencodeapi.QuestionV2Request{}}, nil
+		},
+	}
+	client := setupTestServer(t, handler)
+	mgr := NewManager(t.Context(), client, ManagerOptions{})
+	h := checkHandler(client, mgr, nil)
+
+	_, _, err := h(t.Context(), nil, checkParams{SessionID: "ses-val", MaxFinalChars: -1})
+	require.ErrorContains(t, err, "max_final_chars must not be negative")
+
+	_, _, err = h(t.Context(), nil, checkParams{SessionID: "ses-val", MaxFinalChars: maxFinalTextChars + 1})
+	require.ErrorContains(t, err, "max_final_chars must not exceed")
+
+	_, res, err := h(t.Context(), nil, checkParams{SessionID: "ses-val", MaxFinalChars: 100})
+	require.NoError(t, err)
+	require.Equal(t, "ses-val", res.SessionID)
+}
+
+func TestHandoffReviewCompactBounded(t *testing.T) {
+	repository := t.TempDir()
+	runGit(t, repository, "init")
+	runGit(t, repository, "config", "user.name", "Test User")
+	runGit(t, repository, "config", "user.email", "test@example.com")
+	require.NoError(t, os.WriteFile(filepath.Join(repository, "base.txt"), []byte("base\n"), 0o600))
+	runGit(t, repository, "add", "base.txt")
+	runGit(t, repository, "commit", "-m", "base")
+
+	workspaces, err := workspace.NewManager(workspace.Options{
+		StateDir:    filepath.Join(t.TempDir(), "state"),
+		WorktreeDir: filepath.Join(t.TempDir(), "worktrees"),
+		DefaultMode: workspace.ModeAuto,
+	})
+	require.NoError(t, err)
+	record, err := workspaces.Open(t.Context(), workspace.OpenOptions{Directory: repository}, func(context.Context, string) (string, error) {
+		return "ses-review", nil
+	})
+	require.NoError(t, err)
+
+	for i := 0; i < 25; i++ {
+		name := filepath.Join(record.Directory, "f"+strconv.Itoa(i)+".txt")
+		require.NoError(t, os.WriteFile(name, []byte("x\n"), 0o600))
+	}
+	runGit(t, record.Directory, "add", ".")
+	runGit(t, record.Directory, "commit", "-m", "add many files")
+	for i := 0; i < 3; i++ {
+		runGit(t, record.Directory, "commit", "--allow-empty", "-m", "empty "+strconv.Itoa(i))
+	}
+
+	mgr := NewManager(t.Context(), nil, ManagerOptions{})
+	verify := workspaceVerifyHandler(mgr, workspaces)
+	_, _, err = verify(t.Context(), nil, workspaceVerifyParams{
+		SessionID: "ses-review",
+		Checks: []workspace.VerificationCheck{
+			{Name: "echo ok", Command: "true"},
+			{Name: "fail", Command: "false"},
+		},
+	})
+	require.NoError(t, err)
+
+	review := reviewHandler(workspaces)
+	_, res, err := review(t.Context(), nil, reviewParams{SessionID: "ses-review"})
+	require.NoError(t, err)
+	require.Equal(t, "ses-review", res.SessionID)
+	require.True(t, res.Available)
+	require.True(t, res.HasChanges)
+	require.GreaterOrEqual(t, res.ChangedFileCount, 20)
+	require.LessOrEqual(t, len(res.ChangedFiles), 20)
+	require.GreaterOrEqual(t, res.CommitCount, 4)
+	require.LessOrEqual(t, len(res.Commits), 10)
+	require.NotEmpty(t, res.DiffStat)
+	require.Len(t, res.Verification, 2)
+	require.Equal(t, "echo ok", res.Verification[0].Name)
+	require.Equal(t, "true", res.Verification[0].Command)
+	require.Equal(t, "passed", res.Verification[0].Status)
+	require.Equal(t, 0, res.Verification[0].ExitCode)
+	require.Equal(t, "failed", res.Verification[1].Status)
+	require.NotEqual(t, 0, res.Verification[1].ExitCode)
+
+	encoded, err := json.Marshal(res)
+	require.NoError(t, err)
+	body := string(encoded)
+	require.NotContains(t, body, `"source_directory"`)
+	require.NotContains(t, body, `"repository_root"`)
+	require.NotContains(t, body, `"worktree_root"`)
+	require.NotContains(t, body, `"directory"`)
+	require.NotContains(t, body, `"output"`)
+	require.NotContains(t, body, `"args"`)
+	require.NotContains(t, body, record.Directory)
+
+	_, limited, err := review(t.Context(), nil, reviewParams{
+		SessionID:         "ses-review",
+		ChangedFileLimit:  3,
+		CommitLimit:       2,
+		VerificationLimit: 1,
+	})
+	require.NoError(t, err)
+	require.Len(t, limited.ChangedFiles, 3)
+	require.Len(t, limited.Commits, 2)
+	require.Len(t, limited.Verification, 1)
+	require.Equal(t, "fail", limited.Verification[0].Name)
+
+	_, _, err = review(t.Context(), nil, reviewParams{SessionID: "ses-review", ChangedFileLimit: -1})
+	require.ErrorContains(t, err, "changed_file_limit must not be negative")
+	_, _, err = review(t.Context(), nil, reviewParams{SessionID: "ses-review", ChangedFileLimit: 101})
+	require.ErrorContains(t, err, "changed_file_limit must not exceed")
+	_, _, err = review(t.Context(), nil, reviewParams{SessionID: "missing"})
+	require.ErrorContains(t, err, "no workspace tracked")
 }
 
 func runGit(t *testing.T, directory string, args ...string) {
