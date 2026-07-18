@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -28,6 +29,7 @@ const (
 	defaultExecutorModel    = "xai/grok-4.5"
 	defaultPermissionMode   = "inherit"
 	defaultIsolationMode    = "auto"
+	localStartupTimeout     = 15 * time.Second
 )
 
 type repeatFlag []string
@@ -329,8 +331,53 @@ func (o *opencodeCfg) startLocal(ctx context.Context, defaultBaseURL string, lg 
 			<-done
 		}
 	}
+	if err := waitForTCP(ctx, baseURL, done, localStartupTimeout); err != nil {
+		stop()
+		return "", func() {}, fmt.Errorf("wait for opencode serve: %w", err)
+	}
 
 	return baseURL, stop, nil
+}
+
+func waitForTCP(ctx context.Context, baseURL string, processDone chan error, timeout time.Duration) error {
+	parsed, err := url.Parse(baseURL)
+	if err != nil {
+		return fmt.Errorf("parse server URL: %w", err)
+	}
+	address := parsed.Host
+	if address == "" {
+		return fmt.Errorf("server URL %q has no host", baseURL)
+	}
+	if _, _, err := net.SplitHostPort(address); err != nil {
+		return fmt.Errorf("server URL %q must include a port: %w", baseURL, err)
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	var lastErr error
+	for {
+		connection, err := net.DialTimeout("tcp", address, 250*time.Millisecond)
+		if err == nil {
+			_ = connection.Close()
+			return nil
+		}
+		lastErr = err
+		select {
+		case processErr := <-processDone:
+			processDone <- processErr
+			if processErr == nil {
+				return errors.New("opencode serve exited before accepting connections")
+			}
+			return fmt.Errorf("opencode serve exited before accepting connections: %w", processErr)
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			return fmt.Errorf("timed out after %s: %w", timeout, lastErr)
+		case <-ticker.C:
+		}
+	}
 }
 
 func (o *opencodeCfg) localEnvironment(permission opencode.PermissionMode) []string {
