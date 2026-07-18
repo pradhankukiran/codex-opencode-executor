@@ -376,7 +376,14 @@ func checkHandler(client *Client, mgr *Manager, workspaces *workspace.Manager) m
 		if args.WaitSeconds > 0 {
 			waitCtx, cancel := context.WithTimeout(ctx, time.Duration(min(args.WaitSeconds, 300))*time.Second)
 			defer cancel()
-			_ = client.Wait(waitCtx, loc, args.SessionID)
+			// Prefer the local job store's completion signal for tracked jobs.
+			// OpenCode's session wait can return while the executor job is still
+			// running (e.g. during prompt submission), which made wait_seconds a no-op.
+			if _, tracked := mgr.Job(args.SessionID); tracked {
+				_ = mgr.Wait(waitCtx, args.SessionID)
+			} else {
+				_ = client.Wait(waitCtx, loc, args.SessionID)
+			}
 		}
 
 		args.Directory = loc.Directory

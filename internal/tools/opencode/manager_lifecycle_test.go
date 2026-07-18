@@ -265,6 +265,52 @@ func TestManagerExpiresRecoveredJob(t *testing.T) {
 	require.Equal(t, int32(1), abortCalls.Load())
 }
 
+func TestManagerWaitTerminalWakeupAndUntracked(t *testing.T) {
+	t.Parallel()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	client := &fakeJobClient{
+		prompt: func(ctx context.Context, loc Location, sessionID string, req PromptRequest) (json.RawMessage, error) {
+			close(started)
+			select {
+			case <-release:
+				return json.RawMessage(`{"id":"msg-wait"}`), nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		},
+	}
+	mgr := NewManager(t.Context(), client, ManagerOptions{DefaultTimeout: time.Minute})
+
+	require.NoError(t, mgr.Wait(t.Context(), "missing"))
+
+	_, err := mgr.SubmitJob(t.Context(), Location{}, "ses-mgr-wait", PromptRequest{
+		Prompt: PromptPayload{Text: "wait for me"},
+	}, SubmitOptions{})
+	require.NoError(t, err)
+	<-started
+
+	done := make(chan error, 1)
+	go func() {
+		done <- mgr.Wait(t.Context(), "ses-mgr-wait")
+	}()
+
+	select {
+	case err := <-done:
+		t.Fatalf("Wait returned before job finished: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(release)
+	require.NoError(t, <-done)
+
+	job, ok := mgr.Job("ses-mgr-wait")
+	require.True(t, ok)
+	require.Equal(t, JobDone, job.Status)
+	require.NoError(t, mgr.Wait(t.Context(), "ses-mgr-wait"))
+}
+
 func persistedJobStatus(stateDir, sessionID string) JobStatus {
 	data, err := os.ReadFile(filepath.Join(stateDir, sessionID+".json"))
 	if err != nil {

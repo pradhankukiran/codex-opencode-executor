@@ -55,8 +55,22 @@ type Job struct {
 	UpdatedAt       time.Time `json:"updated_at"`
 	Deadline        time.Time `json:"deadline,omitempty"`
 
-	cancel context.CancelFunc
-	mu     sync.Mutex
+	cancel   context.CancelFunc
+	done     chan struct{}
+	doneOnce sync.Once
+	mu       sync.Mutex
+}
+
+// signalDone closes the job's completion channel exactly once so waiters wake.
+func (j *Job) signalDone() {
+	if j == nil {
+		return
+	}
+	j.doneOnce.Do(func() {
+		if j.done != nil {
+			close(j.done)
+		}
+	})
 }
 
 // jobRecord is the on-disk representation of a Job. Err is stored as a string
@@ -185,6 +199,7 @@ func (m *Manager) loadJobs() {
 			CreatedAt:       rec.CreatedAt,
 			UpdatedAt:       rec.UpdatedAt,
 			Deadline:        rec.Deadline,
+			done:            make(chan struct{}),
 		}
 		if rec.ErrMessage != "" {
 			job.Err = errors.New(rec.ErrMessage)
@@ -193,6 +208,9 @@ func (m *Manager) loadJobs() {
 			job.Status = JobUnknown
 			job.UpdatedAt = time.Now()
 			job.Err = nil
+		}
+		if job.Status.terminal() {
+			job.signalDone()
 		}
 		m.jobs[job.SessionID] = job
 		if job.IdempotencyKey != "" {
@@ -418,6 +436,7 @@ func (m *Manager) SubmitJob(ctx context.Context, loc Location, sessionID string,
 		UpdatedAt:      now,
 		Deadline:       deadline,
 		cancel:         cancel,
+		done:           make(chan struct{}),
 	}
 	m.jobs[sessionID] = job
 	if key != "" {
@@ -478,6 +497,7 @@ func (m *Manager) Cancel(ctx context.Context, loc Location, sessionID string) (C
 		cancel := job.cancel
 		job.cancel = nil
 		job.mu.Unlock()
+		job.signalDone()
 		if cancel != nil {
 			cancel()
 		}
@@ -486,6 +506,36 @@ func (m *Manager) Cancel(ctx context.Context, loc Location, sessionID string) (C
 		job.mu.Unlock()
 	}
 	return CancelResult{Job: snapshotJob(job), Aborted: aborted}, nil
+}
+
+// Wait blocks until the tracked job reaches a terminal state or ctx is done.
+// If sessionID is not tracked, Wait returns nil immediately.
+func (m *Manager) Wait(ctx context.Context, sessionID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	job, ok := m.jobPointer(sessionID)
+	if !ok {
+		return nil
+	}
+
+	job.mu.Lock()
+	if job.Status.terminal() {
+		job.mu.Unlock()
+		return nil
+	}
+	done := job.done
+	job.mu.Unlock()
+	if done == nil {
+		return nil
+	}
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (m *Manager) Job(sessionID string) (*Job, bool) {
@@ -528,7 +578,11 @@ func (m *Manager) Reconcile(sessionID string, finished bool) (*Job, bool) {
 	if finished {
 		job.mu.Lock()
 		var cancel context.CancelFunc
+		changed := false
 		if job.Status != JobCanceled && job.Status != JobTimedOut {
+			if !job.Status.terminal() {
+				changed = true
+			}
 			job.Status = JobDone
 			job.Err = nil
 			job.UpdatedAt = time.Now()
@@ -536,6 +590,9 @@ func (m *Manager) Reconcile(sessionID string, finished bool) (*Job, bool) {
 			job.cancel = nil
 		}
 		job.mu.Unlock()
+		if changed {
+			job.signalDone()
+		}
 		if cancel != nil {
 			cancel()
 		}
@@ -587,6 +644,7 @@ func (m *Manager) run(ctx context.Context, job *Job, req PromptRequest) {
 		job.Err = nil
 	}
 	job.mu.Unlock()
+	job.signalDone()
 	m.saveJob(job)
 }
 
@@ -621,6 +679,7 @@ func (m *Manager) finish(job *Job, status JobStatus, err error, promptMessageID 
 	cancel := job.cancel
 	job.cancel = nil
 	job.mu.Unlock()
+	job.signalDone()
 	if cancel != nil {
 		cancel()
 	}
