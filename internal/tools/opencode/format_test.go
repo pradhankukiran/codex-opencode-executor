@@ -40,7 +40,7 @@ const withPartsMessages = `[
       "path": {"cwd": "/project", "root": "/project"},
       "cost": 0.0042,
       "tokens": {"input": 1500, "output": 800, "reasoning": 0, "cache": {"read": 0, "write": 0}},
-      "finish": "end_turn"
+      "finish": "stop"
     },
     "parts": [
       {"type": "text", "id": "prt_02", "sessionID": "ses_1", "messageID": "msg_asst_01",
@@ -150,10 +150,14 @@ func TestIsSessionFinishedJSON(t *testing.T) {
 		input string
 		want  bool
 	}{
-		{"v2 finished", `[{"info":{"role":"assistant","finish":"stop"}}]`, true},
+		{"v2 finished stop", `[{"info":{"role":"assistant","finish":"stop"}}]`, true},
+		{"v2 finished end_turn", `[{"info":{"role":"assistant","finish":"end_turn"}}]`, true},
+		{"v2 tool-calls not finished", `[{"info":{"role":"assistant","finish":"tool-calls"}}]`, false},
+		{"v2 unknown not finished", `[{"info":{"role":"assistant","finish":"unknown"}}]`, false},
 		{"v2 no finish", `[{"info":{"role":"assistant"}}]`, false},
 		{"v2 empty finish", `[{"info":{"role":"assistant","finish":""}}]`, false},
 		{"flat finished", `[{"role":"assistant","finish":"stop"}]`, true},
+		{"flat tool-calls", `[{"role":"assistant","finish":"tool-calls"}]`, false},
 		{"flat no finish", `[{"role":"assistant"}]`, false},
 		{"flat empty finish", `[{"role":"assistant","finish":""}]`, false},
 		{"empty array", `[]`, false},
@@ -161,6 +165,8 @@ func TestIsSessionFinishedJSON(t *testing.T) {
 		{"not assistant flat", `[{"role":"user","finish":"stop"}]`, false},
 		{"last assistant wins v2", `[{"info":{"role":"assistant","finish":"stop"}},{"info":{"role":"assistant"}}]`, false},
 		{"last assistant wins flat", `[{"role":"assistant","finish":"stop"},{"role":"assistant"}]`, false},
+		{"tool-calls then stop", `[{"info":{"role":"assistant","finish":"tool-calls"}},{"info":{"role":"assistant","finish":"stop"}}]`, true},
+		{"stop then tool-calls", `[{"info":{"role":"assistant","finish":"stop"}},{"info":{"role":"assistant","finish":"tool-calls"}}]`, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -54,6 +54,7 @@ const realisticRunningMessages = `[
 
 // realisticDoneMessages is the finished form of the same session: finished
 // assistant turn with reasoning/tool noise plus a real final answer text part.
+// Live OpenCode 1.18.x uses finish="stop" on the terminal turn.
 const realisticDoneMessages = `[
   {
     "info": {
@@ -77,16 +78,69 @@ const realisticDoneMessages = `[
       "path": {"cwd": "/project", "root": "/project"},
       "cost": 0.01,
       "tokens": {"input": 1500, "output": 400, "reasoning": 80, "cache": {"read": 0, "write": 0}},
-      "finish": "end_turn"
+      "finish": "stop"
     },
     "parts": [
       {"type": "reasoning", "id": "prt_r1", "sessionID": "ses_1", "messageID": "msg_asst_01",
        "text": "INTERNAL NARRATION: extract validateToken into its own helper"},
+      {"type": "text", "id": "prt_progress", "sessionID": "ses_1", "messageID": "msg_asst_01",
+       "text": "PROGRESS NARRATION: about to edit auth.go"},
       {"type": "tool", "id": "prt_tool1", "sessionID": "ses_1", "messageID": "msg_asst_01",
        "tool": "edit", "state": {"status": "completed", "output": "edited auth.go"},
        "text": "TOOL RESULT: edited auth.go"},
       {"type": "text", "id": "prt_final", "sessionID": "ses_1", "messageID": "msg_asst_01",
        "text": "FINAL ANSWER: Extracted validateToken and updated callers."}
+    ]
+  }
+]`
+
+// realisticToolCallsThenStopMessages mirrors live OpenCode 1.18.3 multi-turn
+// agent loops: intermediate assistant turns finish with "tool-calls", and only
+// the last turn finishes with "stop".
+const realisticToolCallsThenStopMessages = `[
+  {
+    "info": {"id": "msg_user_01", "role": "user"},
+    "parts": [{"type": "text", "text": "USER PROMPT: fix the flaky test"}]
+  },
+  {
+    "info": {"id": "msg_asst_01", "role": "assistant", "finish": "tool-calls"},
+    "parts": [
+      {"type": "text", "text": "PROGRESS NARRATION: inspecting the failing test"},
+      {"type": "tool", "tool": "read", "state": {"status": "completed"},
+       "text": "TOOL RESULT: read test.go"}
+    ]
+  },
+  {
+    "info": {"id": "msg_asst_02", "role": "assistant", "finish": "tool-calls"},
+    "parts": [
+      {"type": "text", "text": "PROGRESS NARRATION: applying a patch"},
+      {"type": "tool", "tool": "edit", "state": {"status": "completed"},
+       "text": "TOOL RESULT: edited test.go"}
+    ]
+  },
+  {
+    "info": {"id": "msg_asst_03", "role": "assistant", "finish": "stop"},
+    "parts": [
+      {"type": "reasoning", "text": "INTERNAL NARRATION: the flake was a race"},
+      {"type": "text", "text": "PROGRESS NARRATION: summarizing"},
+      {"type": "text", "text": "FINAL ANSWER: Fixed the race with a wait condition."}
+    ]
+  }
+]`
+
+// realisticToolCallsOnlyMessages is a mid-loop snapshot where every assistant
+// turn so far ended with finish="tool-calls".
+const realisticToolCallsOnlyMessages = `[
+  {
+    "info": {"id": "msg_user_01", "role": "user"},
+    "parts": [{"type": "text", "text": "USER PROMPT: fix the flaky test"}]
+  },
+  {
+    "info": {"id": "msg_asst_01", "role": "assistant", "finish": "tool-calls"},
+    "parts": [
+      {"type": "text", "text": "PROGRESS NARRATION: inspecting the failing test"},
+      {"type": "tool", "tool": "read", "state": {"status": "completed"},
+       "text": "TOOL RESULT: read test.go"}
     ]
   }
 ]`
@@ -282,6 +336,49 @@ func TestHandoffCheckResponseShaping(t *testing.T) {
 		require.Empty(t, res.FinalText)
 		require.Nil(t, res.Messages)
 	})
+
+	t.Run("tool-calls continuation is not finished", func(t *testing.T) {
+		t.Parallel()
+		require.False(t, isSessionFinishedJSON(json.RawMessage(realisticToolCallsOnlyMessages)))
+		require.True(t, openCodeAssistantContinuing(json.RawMessage(realisticToolCallsOnlyMessages)))
+	})
+
+	t.Run("tool-calls then stop is finished with trailing final answer only", func(t *testing.T) {
+		t.Parallel()
+		require.True(t, isSessionFinishedJSON(json.RawMessage(realisticToolCallsThenStopMessages)))
+		got := finalAssistantAnswerText(json.RawMessage(realisticToolCallsThenStopMessages), true)
+		require.Equal(t, "FINAL ANSWER: Fixed the race with a wait condition.", got)
+		require.NotContains(t, got, "PROGRESS NARRATION")
+		require.NotContains(t, got, "INTERNAL NARRATION")
+	})
+
+	t.Run("local JobDone with tool-calls reports running without final_text", func(t *testing.T) {
+		t.Parallel()
+		res := checkViaDoCheck(t, checkShapeFixture{
+			sessionID: "ses-done-race-tool-calls",
+			tracked:   true,
+			jobStatus: JobDone,
+			messages:  realisticToolCallsOnlyMessages,
+			verbose:   false,
+		})
+		require.Equal(t, string(JobRunning), res.Status)
+		require.Empty(t, res.FinalText)
+		require.Nil(t, res.Messages)
+	})
+
+	t.Run("local JobDone with stop reports done and clean final_text", func(t *testing.T) {
+		t.Parallel()
+		res := checkViaDoCheck(t, checkShapeFixture{
+			sessionID: "ses-done-stop",
+			tracked:   true,
+			jobStatus: JobDone,
+			messages:  realisticToolCallsThenStopMessages,
+			verbose:   false,
+		})
+		require.Equal(t, string(JobDone), res.Status)
+		require.Equal(t, "FINAL ANSWER: Fixed the race with a wait condition.", res.FinalText)
+		require.Nil(t, res.Messages)
+	})
 }
 
 func TestFinalAssistantAnswerText(t *testing.T) {
@@ -291,6 +388,7 @@ func TestFinalAssistantAnswerText(t *testing.T) {
 		t.Parallel()
 		got := finalAssistantAnswerText(json.RawMessage(realisticDoneMessages), true)
 		require.Equal(t, "FINAL ANSWER: Extracted validateToken and updated callers.", got)
+		require.NotContains(t, got, "PROGRESS NARRATION")
 	})
 
 	t.Run("running payload yields empty when finish required", func(t *testing.T) {
@@ -299,14 +397,30 @@ func TestFinalAssistantAnswerText(t *testing.T) {
 		require.Empty(t, got)
 	})
 
+	t.Run("tool-calls finish yields empty", func(t *testing.T) {
+		t.Parallel()
+		got := finalAssistantAnswerText(json.RawMessage(realisticToolCallsOnlyMessages), true)
+		require.Empty(t, got)
+	})
+
 	t.Run("never returns user prompt", func(t *testing.T) {
 		t.Parallel()
 		raw := json.RawMessage(`[
 			{"info":{"id":"u","role":"user"},"parts":[{"type":"text","text":"only the user spoke"}]},
-			{"info":{"id":"a","role":"assistant","finish":"end_turn"},"parts":[{"type":"reasoning","text":"thinking only"}]}
+			{"info":{"id":"a","role":"assistant","finish":"stop"},"parts":[{"type":"reasoning","text":"thinking only"}]}
 		]`)
 		require.Empty(t, finalAssistantAnswerText(raw, true))
 	})
+}
+
+func TestIsTerminalFinish(t *testing.T) {
+	t.Parallel()
+	require.True(t, isTerminalFinish("stop"))
+	require.True(t, isTerminalFinish("end_turn"))
+	require.False(t, isTerminalFinish("tool-calls"))
+	require.False(t, isTerminalFinish("unknown"))
+	require.False(t, isTerminalFinish(""))
+	require.False(t, isTerminalFinish("brand-new-reason"))
 }
 
 type checkShapeFixture struct {

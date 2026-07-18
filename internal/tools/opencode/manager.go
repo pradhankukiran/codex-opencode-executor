@@ -632,20 +632,81 @@ func (m *Manager) run(ctx context.Context, job *Job, req PromptRequest) {
 		m.saveJob(job)
 		return
 	}
-
-	job.PromptMessageID = extractMessageID(res)
-	job.UpdatedAt = time.Now()
-	if err != nil {
-		job.Status = JobError
-		job.Err = err
-		m.logger.Warn("opencode executor job failed", "session_id", job.SessionID, "err", err)
-	} else {
-		job.Status = JobDone
-		job.Err = nil
+	promptMessageID := extractMessageID(res)
+	if promptMessageID != "" {
+		job.PromptMessageID = promptMessageID
+		job.UpdatedAt = time.Now()
 	}
 	job.mu.Unlock()
-	job.signalDone()
-	m.saveJob(job)
+
+	if err != nil {
+		m.logger.Warn("opencode executor job failed", "session_id", job.SessionID, "err", err)
+		m.finish(job, JobError, err, promptMessageID)
+		return
+	}
+
+	// Prompt HTTP may return while OpenCode is still in a tool-calls continuation
+	// loop. Keep the job running until the latest assistant finish is terminal.
+	if awaitErr := m.awaitOpenCodeFinished(ctx, job); awaitErr != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			m.timeout(job)
+			return
+		}
+		job.mu.Lock()
+		status := job.Status
+		job.mu.Unlock()
+		if status == JobCanceled || status == JobTimedOut {
+			return
+		}
+		if errors.Is(ctx.Err(), context.Canceled) {
+			job.mu.Lock()
+			job.UpdatedAt = time.Now()
+			job.mu.Unlock()
+			m.saveJob(job)
+			return
+		}
+		m.finish(job, JobError, awaitErr, promptMessageID)
+		return
+	}
+	m.finish(job, JobDone, nil, promptMessageID)
+}
+
+// awaitOpenCodeFinished waits until OpenCode's latest assistant turn has a
+// terminal finish reason, or until there is no continuation signal (empty
+// session / no assistant — used by mocks and fully-inline replies).
+func (m *Manager) awaitOpenCodeFinished(ctx context.Context, job *Job) error {
+	if m.client == nil {
+		return nil
+	}
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		job.mu.Lock()
+		status := job.Status
+		loc := job.Location
+		sessionID := job.SessionID
+		job.mu.Unlock()
+		if status == JobCanceled || status == JobTimedOut {
+			return errors.New("job canceled before OpenCode session finished")
+		}
+
+		msg, err := m.client.Messages(ctx, loc, sessionID)
+		if err == nil {
+			if isSessionFinishedJSON(msg) {
+				return nil
+			}
+			if !openCodeAssistantContinuing(msg) {
+				// No assistant continuation (empty messages after Prompt success).
+				return nil
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 func (m *Manager) timeout(job *Job) {

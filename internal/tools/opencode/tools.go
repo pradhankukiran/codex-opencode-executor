@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"path"
 	"regexp"
-	"slices"
 	"strings"
 	"time"
 
@@ -378,14 +377,7 @@ func checkHandler(client *Client, mgr *Manager, workspaces *workspace.Manager) m
 		if args.WaitSeconds > 0 {
 			waitCtx, cancel := context.WithTimeout(ctx, time.Duration(min(args.WaitSeconds, 300))*time.Second)
 			defer cancel()
-			// Prefer the local job store's completion signal for tracked jobs.
-			// OpenCode's session wait can return while the executor job is still
-			// running (e.g. during prompt submission), which made wait_seconds a no-op.
-			if _, tracked := mgr.Job(args.SessionID); tracked {
-				_ = mgr.Wait(waitCtx, args.SessionID)
-			} else {
-				_ = client.Wait(waitCtx, loc, args.SessionID)
-			}
+			waitForHandoffCheck(waitCtx, client, mgr, loc, args.SessionID)
 		}
 
 		args.Directory = loc.Directory
@@ -400,6 +392,51 @@ func checkHandler(client *Client, mgr *Manager, workspaces *workspace.Manager) m
 			}
 		}
 		return nil, res, err
+	}
+}
+
+// waitForHandoffCheck blocks until a tracked job is truly complete for check
+// purposes, or the wait context expires.
+//
+// Local Manager JobDone can race ahead of OpenCode's agent loop (latest assistant
+// finish still "tool-calls"/"unknown"). In that case we keep polling OpenCode
+// until the latest assistant turn is terminal rather than returning early.
+func waitForHandoffCheck(ctx context.Context, client *Client, mgr *Manager, loc Location, sessionID string) {
+	if _, tracked := mgr.Job(sessionID); !tracked {
+		_ = client.Wait(ctx, loc, sessionID)
+		return
+	}
+
+	_ = mgr.Wait(ctx, sessionID)
+	if ctx.Err() != nil {
+		return
+	}
+
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if job, ok := mgr.Job(sessionID); ok {
+			switch job.Status {
+			case JobError, JobCanceled, JobTimedOut:
+				return
+			}
+		}
+		msg, err := client.Messages(ctx, loc, sessionID)
+		if err == nil {
+			if isSessionFinishedJSON(msg) {
+				return
+			}
+			// Local job may already be Done with empty messages (mocks) — no
+			// OpenCode continuation signal, so waiting further is unnecessary.
+			if !openCodeAssistantContinuing(msg) {
+				return
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
 	}
 }
 
@@ -420,10 +457,16 @@ func doCheck(ctx context.Context, client *Client, mgr *Manager, args checkParams
 	}
 
 	job, _ := mgr.Reconcile(args.SessionID, isFinished)
-	res.Status = string(job.Status)
+	status := job.Status
+	// Authoritative completion requires a terminal OpenCode assistant finish.
+	// Local JobDone from Prompt return must not stop Codex while tool-calls continue.
+	if status == JobDone && !isFinished && openCodeAssistantContinuing(msg) {
+		status = JobRunning
+	}
+	res.Status = string(status)
 	res.IdempotencyKey = job.IdempotencyKey
 	res.Deadline = formatDeadline(job.Deadline)
-	if job.Err != nil {
+	if status != JobRunning && job.Err != nil {
 		res.JobError = job.Err.Error()
 	}
 	return shapeHandoffCheckResult(res, msg, args.Verbose, isFinished), nil
@@ -756,31 +799,9 @@ func fillPendingRequests(ctx context.Context, client *Client, loc Location, res 
 }
 
 func isSessionFinishedJSON(raw json.RawMessage) bool {
-	// Try v2 format: messages are objects with an "info" wrapper.
-	var v2 []struct {
-		Info struct {
-			Role   string  `json:"role"`
-			Finish *string `json:"finish"`
-		} `json:"info"`
+	finish, ok := latestAssistantFinish(raw)
+	if !ok {
+		return false
 	}
-	if err := json.Unmarshal(raw, &v2); err == nil {
-		for _, msg := range slices.Backward(v2) {
-			if msg.Info.Role == "assistant" {
-				return msg.Info.Finish != nil && *msg.Info.Finish != ""
-			}
-		}
-	}
-	// Try flat format (instance route): role and finish are top-level fields.
-	var flat []struct {
-		Role   string  `json:"role"`
-		Finish *string `json:"finish"`
-	}
-	if err := json.Unmarshal(raw, &flat); err == nil {
-		for _, msg := range slices.Backward(flat) {
-			if msg.Role == "assistant" {
-				return msg.Finish != nil && *msg.Finish != ""
-			}
-		}
-	}
-	return false
+	return isTerminalFinish(finish)
 }

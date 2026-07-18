@@ -43,7 +43,8 @@ func (f *fakeJobClient) Wait(ctx context.Context, loc Location, sessionID string
 
 func (f *fakeJobClient) Messages(ctx context.Context, loc Location, sessionID string) (json.RawMessage, error) {
 	if f.messages == nil {
-		return nil, errors.New("unexpected Messages call")
+		// Default empty session: Prompt success with no assistant continuation.
+		return json.RawMessage(`[]`), nil
 	}
 	return f.messages(ctx, loc, sessionID)
 }

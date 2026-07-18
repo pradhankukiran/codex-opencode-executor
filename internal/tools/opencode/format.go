@@ -18,12 +18,32 @@ func firstText(raw json.RawMessage) string {
 	return texts[len(texts)-1]
 }
 
-// finalAssistantAnswerText returns only completed assistant answer text from an
-// OpenCode message list. It never falls back to user prompts, and skips
-// reasoning/thinking/tool parts when part types are present.
+// isTerminalFinish classifies an OpenCode assistant info.finish reason.
 //
-// When requireFinished is true, the chosen assistant message must expose a
-// non-empty finish field (session still running / incomplete turn → "").
+// Compatibility (OpenCode 1.18.x agent loop + common providers):
+//   - nonterminal continuation: "tool-calls", "tool_calls", "unknown"
+//   - terminal completed turn: "stop", "end_turn", plus a few completed-turn aliases
+//   - empty / unrecognized: not terminal (conservative — do not stop polling early)
+func isTerminalFinish(finish string) bool {
+	switch strings.ToLower(strings.TrimSpace(finish)) {
+	case "":
+		return false
+	case "tool-calls", "tool_calls", "unknown":
+		return false
+	case "stop", "end_turn", "end-turn", "length", "max_tokens", "content_filter", "content-filter", "error", "refusal", "refuse", "cancelled", "canceled":
+		return true
+	default:
+		return false
+	}
+}
+
+// finalAssistantAnswerText returns only the trailing answer text from the latest
+// terminal assistant turn. It never falls back to user prompts, skips
+// reasoning/thinking/tool parts, and ignores earlier progress narration text
+// parts within the turn (only the last answer text part is kept).
+//
+// When requireFinished is true (always for handoff_check final_text), the latest
+// assistant turn must expose a terminal finish reason.
 func finalAssistantAnswerText(raw json.RawMessage, requireFinished bool) string {
 	if len(raw) == 0 {
 		return ""
@@ -32,19 +52,20 @@ func finalAssistantAnswerText(raw json.RawMessage, requireFinished bool) string 
 	if err := json.Unmarshal(raw, &v); err != nil {
 		return ""
 	}
-	var lastAnswer string
+	var latest map[string]any
 	for _, item := range collectObjects(nil, v) {
 		if messageRole(item) != "assistant" {
 			continue
 		}
-		if requireFinished && !messageFinished(item) {
-			continue
-		}
-		if answer := assistantAnswerText(item); answer != "" {
-			lastAnswer = answer
-		}
+		latest = item
 	}
-	return lastAnswer
+	if latest == nil {
+		return ""
+	}
+	if requireFinished && !messageFinished(latest) {
+		return ""
+	}
+	return assistantAnswerText(latest)
 }
 
 // shapeHandoffCheckResult centralizes handoff_check final_text/messages policy
@@ -54,8 +75,8 @@ func finalAssistantAnswerText(raw json.RawMessage, requireFinished bool) string 
 //   - verbose=false → omit messages for every status
 //   - verbose=true  → bounded raw messages (including while running)
 //   - running/unknown → never set final_text
-//   - done → final_text from final assistant answer text only
-//   - error/canceled/timed_out → final_text only when a finished assistant answer exists
+//   - done → final_text only when latest assistant finish is terminal
+//   - error/canceled/timed_out → final_text only when a terminal assistant answer exists
 //   - untracked uses the same rules via status done|running from isFinished
 func shapeHandoffCheckResult(res HandoffCheckResult, msg json.RawMessage, verbose bool, isFinished bool) HandoffCheckResult {
 	res.Messages = nil
@@ -68,19 +89,14 @@ func shapeHandoffCheckResult(res HandoffCheckResult, msg json.RawMessage, verbos
 	switch JobStatus(res.Status) {
 	case JobRunning, JobUnknown:
 		return res
-	case JobDone:
-		if len(msg) > 0 {
-			// Job/session completion is authoritative; still never use user/tool/reasoning text.
-			res.FinalText = truncateText(finalAssistantAnswerText(msg, false), 4000)
-		}
-		return res
-	case JobError, JobCanceled, JobTimedOut:
+	case JobDone, JobError, JobCanceled, JobTimedOut:
+		// Always require a terminal OpenCode assistant finish for final_text,
+		// even when the local Manager already says JobDone (tool-calls race).
 		if len(msg) > 0 {
 			res.FinalText = truncateText(finalAssistantAnswerText(msg, true), 4000)
 		}
 		return res
 	default:
-		// Untracked / unknown status strings: only emit final_text when finished.
 		if isFinished && len(msg) > 0 {
 			res.FinalText = truncateText(finalAssistantAnswerText(msg, true), 4000)
 		}
@@ -88,18 +104,24 @@ func shapeHandoffCheckResult(res HandoffCheckResult, msg json.RawMessage, verbos
 	}
 }
 
-func messageFinished(m map[string]any) bool {
+// messageFinish returns the assistant finish reason from flat or WithParts shapes.
+func messageFinish(m map[string]any) string {
 	if finish := stringField(m, "finish"); finish != "" {
-		return true
+		return finish
 	}
 	if info, ok := m["info"].(map[string]any); ok {
-		if finish := stringField(info, "finish"); finish != "" {
-			return true
-		}
+		return stringField(info, "finish")
 	}
-	return false
+	return ""
 }
 
+// messageFinished is true only when the assistant turn has a terminal finish reason.
+func messageFinished(m map[string]any) bool {
+	return isTerminalFinish(messageFinish(m))
+}
+
+// assistantAnswerText returns only the trailing answer text part for one assistant
+// message — not a join of earlier progress narration before tool calls.
 func assistantAnswerText(m map[string]any) string {
 	parts := assistantPartValues(m)
 	if len(parts) == 0 {
@@ -111,16 +133,49 @@ func assistantAnswerText(m map[string]any) string {
 		}
 		return ""
 	}
-	var texts []string
+	var last string
 	for _, part := range parts {
 		if !isAnswerPart(part) {
 			continue
 		}
 		if text := strings.TrimSpace(stringField(part, "text")); text != "" {
-			texts = append(texts, text)
+			last = text
 		}
 	}
-	return strings.Join(texts, "\n")
+	return last
+}
+
+// latestAssistantFinish returns the finish reason of the latest assistant message.
+// ok is false when no assistant message exists.
+func latestAssistantFinish(raw json.RawMessage) (finish string, ok bool) {
+	if len(raw) == 0 {
+		return "", false
+	}
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return "", false
+	}
+	var latest map[string]any
+	for _, item := range collectObjects(nil, v) {
+		if messageRole(item) != "assistant" {
+			continue
+		}
+		latest = item
+	}
+	if latest == nil {
+		return "", false
+	}
+	return messageFinish(latest), true
+}
+
+// openCodeAssistantContinuing reports that OpenCode still has an in-flight or
+// continuable assistant turn (missing finish, tool-calls, unknown, etc.).
+func openCodeAssistantContinuing(raw json.RawMessage) bool {
+	finish, ok := latestAssistantFinish(raw)
+	if !ok {
+		return false
+	}
+	return !isTerminalFinish(finish)
 }
 
 func assistantPartValues(m map[string]any) []map[string]any {
