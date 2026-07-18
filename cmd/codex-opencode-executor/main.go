@@ -30,6 +30,7 @@ const (
 	defaultExecutorModel    = "xai/grok-4.5"
 	defaultPermissionMode   = "inherit"
 	defaultIsolationMode    = "auto"
+	defaultToolset          = "full"
 	localStartupTimeout     = 15 * time.Second
 )
 
@@ -56,6 +57,11 @@ func main() {
 	executorOpts, err := ocode.ExecutorOptions()
 	if err != nil {
 		slog.Error("configure executor defaults", "err", err)
+		os.Exit(1)
+	}
+	toolset, err := opencode.ParseToolset(ocode.Toolset)
+	if err != nil {
+		slog.Error("configure toolset", "err", err)
 		os.Exit(1)
 	}
 	workspaceMode, err := workspace.ParseMode(ocode.IsolationMode)
@@ -95,7 +101,7 @@ func main() {
 		StateDir:       ocode.StateDir,
 		DefaultTimeout: ocode.SyncTimeout,
 	})
-	opencode.Register(s, client, mgr, workspaces, executorOpts)
+	opencode.Register(s, client, mgr, workspaces, executorOpts, toolset)
 
 	if err := s.Run(ctx, &mcp.StdioTransport{}); err != nil {
 		slog.Error("failed to run server", "err", err)
@@ -135,6 +141,7 @@ type opencodeCfg struct {
 	WorkspaceStateDir string
 	WorktreeDir       string
 	IsolationMode     string
+	Toolset           string
 	LogAPI            bool
 	DefaultModel      string
 	DefaultAgent      string
@@ -158,6 +165,7 @@ func (o *opencodeCfg) Register(_ *flag.FlagSet) {
 	flag.StringVar(&o.WorkspaceStateDir, "workspace-state-dir", envDefault("CODEX_OPENCODE_EXECUTOR_WORKSPACE_STATE_DIR", defaultWorkspaceStateDir()), "directory for persisting session workspace state (env: CODEX_OPENCODE_EXECUTOR_WORKSPACE_STATE_DIR)")
 	flag.StringVar(&o.WorktreeDir, "worktree-dir", envDefault("CODEX_OPENCODE_EXECUTOR_WORKTREE_DIR", defaultWorktreeDir()), "parent directory for executor-owned Git worktrees (env: CODEX_OPENCODE_EXECUTOR_WORKTREE_DIR)")
 	flag.StringVar(&o.IsolationMode, "isolation-mode", envDefault("CODEX_OPENCODE_EXECUTOR_ISOLATION_MODE", defaultIsolationMode), "default workspace isolation: auto, worktree, or none (env: CODEX_OPENCODE_EXECUTOR_ISOLATION_MODE)")
+	flag.StringVar(&o.Toolset, "toolset", envDefault("CODEX_OPENCODE_EXECUTOR_TOOLSET", defaultToolset), "MCP toolset: core (token-efficient) or full (all tools) (env: CODEX_OPENCODE_EXECUTOR_TOOLSET)")
 	flag.StringVar(&o.DefaultModel, "default-model", envDefault("CODEX_OPENCODE_EXECUTOR_DEFAULT_MODEL", defaultExecutorModel), "default model for new sessions in provider/model form; pass an empty value to use opencode's default (env: CODEX_OPENCODE_EXECUTOR_DEFAULT_MODEL)")
 	flag.StringVar(&o.DefaultAgent, "default-agent", os.Getenv("CODEX_OPENCODE_EXECUTOR_DEFAULT_AGENT"), "default opencode agent for new sessions and prompts; empty uses opencode's default (env: CODEX_OPENCODE_EXECUTOR_DEFAULT_AGENT)")
 	flag.StringVar(&o.PermissionMode, "permission-mode", envDefault("CODEX_OPENCODE_EXECUTOR_PERMISSION_MODE", defaultPermissionMode), "default permission mode for new sessions: inherit, ask, deny, or yolo (env: CODEX_OPENCODE_EXECUTOR_PERMISSION_MODE)")

@@ -22,102 +22,138 @@ const (
 	maxVerificationTimeoutSeconds = 60 * 60
 )
 
-// Register adds opencode handoff tools to an MCP server.
-func Register(s *mcp.Server, client *Client, mgr *Manager, workspaces *workspace.Manager, opts ExecutorOptions) {
-	mcputil.Register(s, mcputil.ToolDef{
-		Name:        "handoff_health",
-		Description: "Check connectivity to the configured opencode HTTP server. Call this if other handoff tools return connection or authentication errors.",
-		Flags:       mcputil.ReadOnly,
-	}, healthHandler(client))
+// toolRegistrar binds a tool name to its MCP registration function.
+// Catalog order is the single source of registration order (must match fullToolOrder).
+type toolRegistrar struct {
+	name string
+	add  func(*mcp.Server)
+}
 
-	mcputil.Register(s, mcputil.ToolDef{
-		Name:        "handoff_agents",
-		Description: "List opencode agents available for a directory/workspace.",
-		Flags:       mcputil.ReadOnly,
-	}, agentsHandler(client))
+// toolCatalog returns every handoff tool in deterministic full-set order.
+// Membership filtering happens in Register via Toolset.Includes.
+func toolCatalog(client *Client, mgr *Manager, workspaces *workspace.Manager, opts ExecutorOptions) []toolRegistrar {
+	return []toolRegistrar{
+		{name: ToolHandoffHealth, add: func(s *mcp.Server) {
+			mcputil.Register(s, mcputil.ToolDef{
+				Name:        ToolHandoffHealth,
+				Description: "Check connectivity to the configured opencode HTTP server.",
+				Flags:       mcputil.ReadOnly,
+			}, healthHandler(client))
+		}},
+		{name: ToolHandoffAgents, add: func(s *mcp.Server) {
+			mcputil.Register(s, mcputil.ToolDef{
+				Name:        ToolHandoffAgents,
+				Description: "List opencode agents available for a directory/workspace.",
+				Flags:       mcputil.ReadOnly,
+			}, agentsHandler(client))
+		}},
+		{name: ToolHandoffModels, add: func(s *mcp.Server) {
+			mcputil.Register(s, mcputil.ToolDef{
+				Name:        ToolHandoffModels,
+				Description: "List providers and optionally models. Each model has canonical_model (provider_id/model_id, embedded slashes kept) for handoff_create_session.model or execute model. Gateway vs direct are distinct exact selectors (e.g. vercel/xai/grok-4.5 vs xai/grok-4.5). filter: substring, glob, or regex; limit caps models (default 50).",
+				Flags:       mcputil.ReadOnly,
+			}, modelsHandler(client))
+		}},
+		{name: ToolHandoffSessions, add: func(s *mcp.Server) {
+			mcputil.Register(s, mcputil.ToolDef{
+				Name:        ToolHandoffSessions,
+				Description: "List opencode sessions visible in a directory/workspace.",
+				Flags:       mcputil.ReadOnly,
+			}, sessionsHandler(client))
+		}},
+		{name: ToolHandoffCreateSession, add: func(s *mcp.Server) {
+			mcputil.Register(s, mcputil.ToolDef{
+				Name:        ToolHandoffCreateSession,
+				Description: "Create a session; returns session_id for handoff_fire. Uses configured defaults unless overridden. Auto isolation: worktree for clean Git, else direct. create_directory=true creates a missing exact path as greenfield (parent must exist; existing paths refused).",
+			}, createSessionHandler(client, workspaces, opts))
+		}},
+		{name: ToolHandoffFire, add: func(s *mcp.Server) {
+			mcputil.Register(s, mcputil.ToolDef{
+				Name:        ToolHandoffFire,
+				Description: "Submit a prompt to an existing session and return immediately. Requires session_id from handoff_create_session. Poll with handoff_check.",
+			}, fireHandler(client, mgr, workspaces, opts))
+		}},
+		{name: ToolHandoffExecute, add: func(s *mcp.Server) {
+			mcputil.Register(s, mcputil.ToolDef{
+				Name: ToolHandoffExecute,
+				Description: "Create session, submit prompt, wait (default 300s) or async=true for immediate return after submit. " +
+					"Wait expiry returns status=running with session_id for handoff_check (not an error). " +
+					"Profiles add server-owned suffixes without replacing the task. " +
+					"idempotency_key is submission-only after session create — not whole-call retry-idempotent.",
+			}, executeHandler(client, mgr, workspaces, opts))
+		}},
+		{name: ToolHandoffCheck, add: func(s *mcp.Server) {
+			mcputil.Register(s, mcputil.ToolDef{
+				Name:        ToolHandoffCheck,
+				Description: "Poll session progress. Omits workspace unless include_workspace=true. final_text is terminal-only (default 1200 chars).",
+				Flags:       mcputil.ReadOnly,
+			}, checkHandler(client, mgr, workspaces))
+		}},
+		{name: ToolHandoffReview, add: func(s *mcp.Server) {
+			mcputil.Register(s, mcputil.ToolDef{
+				Name:        ToolHandoffReview,
+				Description: "Compact workspace review: changed files, commits, diff stat, verification (no paths/metadata/diffs).",
+				Flags:       mcputil.ReadOnly,
+			}, reviewHandler(workspaces))
+		}},
+		{name: ToolHandoffCancel, add: func(s *mcp.Server) {
+			mcputil.Register(s, mcputil.ToolDef{
+				Name:        ToolHandoffCancel,
+				Description: "Cancel active execution for a session. Idempotent when already terminal.",
+				Flags:       mcputil.Destructive,
+			}, cancelHandler(mgr, workspaces))
+		}},
+		{name: ToolHandoffWorkspace, add: func(s *mcp.Server) {
+			mcputil.Register(s, mcputil.ToolDef{
+				Name:        ToolHandoffWorkspace,
+				Description: "Inspect the durable workspace bound to a session: changed files, commits, diff stats, verification. Greenfield is available before Git init and uses the empty tree after history exists.",
+				Flags:       mcputil.ReadOnly,
+			}, workspaceInspectHandler(workspaces))
+		}},
+		{name: ToolHandoffDiff, add: func(s *mcp.Server) {
+			mcputil.Register(s, mcputil.ToolDef{
+				Name:        ToolHandoffDiff,
+				Description: "Bounded tracked-file Git diff vs session start (or empty tree for greenfield). Untracked names: handoff_workspace.",
+				Flags:       mcputil.ReadOnly,
+			}, workspaceDiffHandler(workspaces))
+		}},
+		{name: ToolHandoffVerify, add: func(s *mcp.Server) {
+			mcputil.Register(s, mcputil.ToolDef{
+				Name:        ToolHandoffVerify,
+				Description: "Run executable+argv verification checks in a completed session workspace and record pass/fail. No shell expansion.",
+				Flags:       mcputil.Destructive,
+			}, workspaceVerifyHandler(mgr, workspaces))
+		}},
+		{name: ToolHandoffCleanup, add: func(s *mcp.Server) {
+			mcputil.Register(s, mcputil.ToolDef{
+				Name:        ToolHandoffCleanup,
+				Description: "Remove an executor-owned workspace (worktree or greenfield). Clean owned workspaces remove by default; force=true discards changes/commits. Idempotent.",
+				Flags:       mcputil.Destructive,
+			}, workspaceCleanupHandler(mgr, workspaces))
+		}},
+		{name: ToolHandoffPermissionReply, add: func(s *mcp.Server) {
+			mcputil.Register(s, mcputil.ToolDef{
+				Name:        ToolHandoffPermissionReply,
+				Description: "Reply to a pending permission request. See handoff_check for pending permissions.",
+			}, permissionReplyHandler(client, workspaces))
+		}},
+		{name: ToolHandoffQuestionReply, add: func(s *mcp.Server) {
+			mcputil.Register(s, mcputil.ToolDef{
+				Name:        ToolHandoffQuestionReply,
+				Description: "Reply to or reject a pending clarification question. See handoff_check for pending questions.",
+			}, questionReplyHandler(client, workspaces))
+		}},
+	}
+}
 
-	mcputil.Register(s, mcputil.ToolDef{
-		Name:        "handoff_models",
-		Description: "List opencode providers and optionally models. Each model includes canonical_model (provider_id + '/' + complete model id, preserving embedded slashes), which can be passed directly to handoff_create_session.model. Gateway and direct routes are distinct exact selectors (e.g. vercel/xai/grok-4.5 vs xai/grok-4.5). Supports substring, glob (e.g. 'openai/gpt-*-mini'), or regex filtering and a result limit to avoid cluttering context with large provider catalogs (e.g. OpenRouter). When filter is set, the response includes only providers represented by the final returned models (after filtering and limit).",
-		Flags:       mcputil.ReadOnly,
-	}, modelsHandler(client))
-
-	mcputil.Register(s, mcputil.ToolDef{
-		Name:        "handoff_sessions",
-		Description: "List opencode sessions visible in a directory/workspace.",
-		Flags:       mcputil.ReadOnly,
-	}, sessionsHandler(client))
-
-	mcputil.Register(s, mcputil.ToolDef{
-		Name:        "handoff_create_session",
-		Description: "Create a new opencode session and return its session_id. Configured model, agent, permission, and workspace-isolation defaults are used unless overridden. Auto isolation uses a worktree for clean Git projects and runs directly otherwise. Set create_directory=true with an explicit directory to create a missing exact target path as an executor-owned greenfield workspace (parent must exist; existing paths are refused). Use the returned session_id with handoff_fire.",
-	}, createSessionHandler(client, workspaces, opts))
-
-	mcputil.Register(s, mcputil.ToolDef{
-		Name:        "handoff_fire",
-		Description: "Submit a prompt to an existing opencode session and return immediately. The configured default agent is used unless overridden. Requires a session_id from handoff_create_session. Use handoff_check with the session_id to poll progress.",
-	}, fireHandler(client, mgr, workspaces, opts))
-
-	mcputil.Register(s, mcputil.ToolDef{
-		Name: "handoff_execute",
-		Description: "Deep routine-delegation tool: create a session, submit a prompt, wait for completion, and return a compact final check (plus optional compact review). " +
-			"Preserves low-level tools for finer control. Default wait is 300s; set async=true for immediate return after submit. " +
-			"On wait expiry returns status=running with session_id for handoff_check (not an error). " +
-			"Server-owned profile suffixes shape executor behavior without overriding the caller's task details. " +
-			"idempotency_key is submission-scoped after session creation only — it does not make the whole execute operation retry-idempotent.",
-	}, executeHandler(client, mgr, workspaces, opts))
-
-	mcputil.Register(s, mcputil.ToolDef{
-		Name:        "handoff_check",
-		Description: "Poll progress for a session_id from handoff_fire. Omits workspace data by default; set include_workspace=true to attach a compact report. final_text is terminal-only and bounded (default 1200 chars).",
-		Flags:       mcputil.ReadOnly,
-	}, checkHandler(client, mgr, workspaces))
-
-	mcputil.Register(s, mcputil.ToolDef{
-		Name:        "handoff_review",
-		Description: "Compact read-only review of a session workspace: changed files, commits, diff stat, and verification status without paths/metadata or diffs.",
-		Flags:       mcputil.ReadOnly,
-	}, reviewHandler(workspaces))
-
-	mcputil.Register(s, mcputil.ToolDef{
-		Name:        "handoff_cancel",
-		Description: "Cancel active opencode execution for a session. Cancellation is idempotent for jobs already in a terminal state.",
-		Flags:       mcputil.Destructive,
-	}, cancelHandler(mgr, workspaces))
-
-	mcputil.Register(s, mcputil.ToolDef{
-		Name:        "handoff_workspace",
-		Description: "Inspect the durable workspace bound to an opencode session, including changed files, commits, diff statistics, and recorded verification checks. Greenfield workspaces are available before Git init and report the whole project relative to an empty tree after Git history exists.",
-		Flags:       mcputil.ReadOnly,
-	}, workspaceInspectHandler(workspaces))
-
-	mcputil.Register(s, mcputil.ToolDef{
-		Name:        "handoff_diff",
-		Description: "Read a bounded tracked-file Git diff for a session workspace relative to its starting commit (or the empty tree for greenfield repositories). Untracked file names are available from handoff_workspace.",
-		Flags:       mcputil.ReadOnly,
-	}, workspaceDiffHandler(workspaces))
-
-	mcputil.Register(s, mcputil.ToolDef{
-		Name:        "handoff_verify",
-		Description: "Run explicit executable-and-argv verification checks in a completed session workspace and durably record structured pass/fail results. Commands run directly without implicit shell expansion.",
-		Flags:       mcputil.Destructive,
-	}, workspaceVerifyHandler(mgr, workspaces))
-
-	mcputil.Register(s, mcputil.ToolDef{
-		Name:        "handoff_cleanup",
-		Description: "Remove an executor-owned workspace after execution (Git worktree or greenfield directory). Clean owned workspaces are removed by default; force=true is required to discard files, changes, or commits. Cleanup is idempotent.",
-		Flags:       mcputil.Destructive,
-	}, workspaceCleanupHandler(mgr, workspaces))
-
-	mcputil.Register(s, mcputil.ToolDef{
-		Name:        "handoff_permission_reply",
-		Description: "Reply to an opencode permission request for a session. Use handoff_check to see pending permissions.",
-	}, permissionReplyHandler(client, workspaces))
-
-	mcputil.Register(s, mcputil.ToolDef{
-		Name:        "handoff_question_reply",
-		Description: "Reply to or reject an opencode clarification question for a session. Use handoff_check to see pending questions.",
-	}, questionReplyHandler(client, workspaces))
+// Register adds opencode handoff tools for the given toolset to an MCP server.
+func Register(s *mcp.Server, client *Client, mgr *Manager, workspaces *workspace.Manager, opts ExecutorOptions, toolset Toolset) {
+	for _, tool := range toolCatalog(client, mgr, workspaces, opts) {
+		if !toolset.Includes(tool.name) {
+			continue
+		}
+		tool.add(s)
+	}
 }
 
 type locationParams struct {
@@ -158,9 +194,9 @@ func agentsHandler(client *Client) mcp.ToolHandlerFor[locationParams, AgentsResu
 
 type modelsParams struct {
 	locationParams
-	IncludeModels bool   `json:"include_models,omitempty" jsonschema:"If true, includes the list of individual models. Defaults to false."`
-	Filter        string `json:"filter,omitempty" jsonschema:"Optional substring, glob, or regex to filter models (e.g., 'xai/', 'openai/gpt-*-mini'). Implies include_models=true. When set, providers are limited to those represented by the final returned models."`
-	Limit         int    `json:"limit,omitempty" jsonschema:"Maximum number of models to return when include_models is true. Defaults to 50; pass -1 for no limit. Zero is treated as the default. With filter set, providers are trimmed to those still represented after this limit."`
+	IncludeModels bool   `json:"include_models,omitempty" jsonschema:"Include individual models. Default false."`
+	Filter        string `json:"filter,omitempty" jsonschema:"Substring, glob, or regex (e.g. 'xai/', 'openai/gpt-*-mini'). Implies include_models; providers trimmed to final models."`
+	Limit         int    `json:"limit,omitempty" jsonschema:"Max models when include_models. Default 50; -1 unlimited; 0=default."`
 }
 
 func modelsHandler(client *Client) mcp.ToolHandlerFor[modelsParams, ModelsResult] {
@@ -271,13 +307,13 @@ type createSessionParams struct {
 	locationParams
 	Title           string `json:"title,omitempty" jsonschema:"Optional session title."`
 	ParentID        string `json:"parent_id,omitempty" jsonschema:"Optional parent session ID."`
-	Model           string `json:"model,omitempty" jsonschema:"Optional model in provider/model form (e.g. 'xai/grok-4.5'). Overrides the configured default. Model is fixed for the lifetime of the session."`
-	ProviderID      string `json:"provider_id,omitempty" jsonschema:"Optional model provider id for compatibility. Must be used with model_id and cannot be combined with model."`
-	ModelID         string `json:"model_id,omitempty" jsonschema:"Optional model id for compatibility. Must be used with provider_id and cannot be combined with model. Model is fixed for the lifetime of the session."`
-	Agent           string `json:"agent,omitempty" jsonschema:"Optional opencode agent name. Overrides the configured default agent."`
-	PermissionMode  string `json:"permission_mode,omitempty" jsonschema:"Optional permission mode: inherit, ask, deny, or yolo. Overrides the configured default for this session."`
-	IsolationMode   string `json:"isolation_mode,omitempty" jsonschema:"Optional workspace isolation: auto, worktree, or none. Auto uses a worktree for clean Git projects and runs directly otherwise. Ignored when create_directory creates a greenfield workspace."`
-	CreateDirectory bool   `json:"create_directory,omitempty" jsonschema:"If true, create the exact missing directory as an executor-owned greenfield workspace before opening OpenCode. Requires a non-empty explicit directory whose parent already exists. Fails if the target already exists (including empty dirs or final-component symlinks). Defaults to false; missing directories still fail without this opt-in."`
+	Model           string `json:"model,omitempty" jsonschema:"Optional provider/model (e.g. 'xai/grok-4.5'). Overrides default; fixed for session lifetime."`
+	ProviderID      string `json:"provider_id,omitempty" jsonschema:"Optional provider id; requires model_id; cannot combine with model."`
+	ModelID         string `json:"model_id,omitempty" jsonschema:"Optional model id; requires provider_id; cannot combine with model. Fixed for session lifetime."`
+	Agent           string `json:"agent,omitempty" jsonschema:"Optional agent name; overrides configured default."`
+	PermissionMode  string `json:"permission_mode,omitempty" jsonschema:"Optional: inherit, ask, deny, or yolo. Overrides session default."`
+	IsolationMode   string `json:"isolation_mode,omitempty" jsonschema:"auto, worktree, or none. Auto: worktree for clean Git else direct. Ignored with create_directory greenfield."`
+	CreateDirectory bool   `json:"create_directory,omitempty" jsonschema:"Create missing exact directory as greenfield (parent must exist; existing paths refused including empty dirs/symlinks). Default false."`
 }
 
 func createSessionHandler(client *Client, workspaces *workspace.Manager, opts ExecutorOptions) mcp.ToolHandlerFor[createSessionParams, CreateSessionResult] {
@@ -432,15 +468,15 @@ const (
 
 type executeParams struct {
 	createSessionParams
-	Prompt         string `json:"prompt" jsonschema:"Task to delegate to opencode. Profile suffixes are appended by the server and never replace this text."`
-	TimeoutSeconds int    `json:"timeout_seconds,omitempty" jsonschema:"Execution deadline in seconds. Zero uses the server default. Maximum 86400 seconds."`
+	Prompt         string `json:"prompt" jsonschema:"Task text. Server may append profile suffix; never replaces this."`
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty" jsonschema:"Execution deadline seconds. 0=server default; max 86400."`
 	// WaitSeconds uses a pointer so omitted (default 300) differs from explicit 0.
-	WaitSeconds    *int   `json:"wait_seconds,omitempty" jsonschema:"Max seconds to wait after submit (0-300). Omitted defaults to 300. Use async=true for immediate return after submit."`
-	Async          bool   `json:"async,omitempty" jsonschema:"If true, return immediately after submit (equivalent to wait_seconds=0). Use handoff_check with the returned session_id to poll."`
-	MaxFinalChars  int    `json:"max_final_chars,omitempty" jsonschema:"Max final_text characters. Default 1200; maximum 4000."`
-	Profile        string `json:"profile,omitempty" jsonschema:"Server-owned concise suffix: implementation (default), diagnosis, review, or none. none passes the user prompt unchanged."`
-	IdempotencyKey string `json:"idempotency_key,omitempty" jsonschema:"Optional retry key scoped only to job submission after session creation. Does not make the whole handoff_execute call retry-idempotent; a retry creates a new session."`
-	SkipReview     bool   `json:"skip_review,omitempty" jsonschema:"If true, omit the compact review block even after terminal completion."`
+	WaitSeconds    *int   `json:"wait_seconds,omitempty" jsonschema:"Wait after submit 0-300s; omit=300. Use async=true for immediate return."`
+	Async          bool   `json:"async,omitempty" jsonschema:"Immediate return after submit (wait_seconds=0). Poll with handoff_check."`
+	MaxFinalChars  int    `json:"max_final_chars,omitempty" jsonschema:"Max final_text chars. Default 1200; max 4000."`
+	Profile        string `json:"profile,omitempty" jsonschema:"implementation (default), diagnosis, review, or none (prompt unchanged)."`
+	IdempotencyKey string `json:"idempotency_key,omitempty" jsonschema:"Retry key for job submit after session create only; not whole-call idempotent (retry makes new session)."`
+	SkipReview     bool   `json:"skip_review,omitempty" jsonschema:"Omit compact review after terminal completion."`
 }
 
 // resolveExecuteWaitSeconds maps async/wait_seconds to a concrete wait budget.
@@ -621,10 +657,10 @@ func submitOptions(args fireParams) (SubmitOptions, error) {
 type checkParams struct {
 	locationParams
 	SessionID        string `json:"session_id" jsonschema:"opencode session id."`
-	Verbose          bool   `json:"verbose,omitempty" jsonschema:"Include bounded raw messages for diagnostics. Default omits messages."`
-	WaitSeconds      int    `json:"wait_seconds,omitempty" jsonschema:"Max seconds to wait for completion (0-300). 0 = no wait."`
-	IncludeWorkspace bool   `json:"include_workspace,omitempty" jsonschema:"Attach a compact workspace report. Default omits workspace data."`
-	MaxFinalChars    int    `json:"max_final_chars,omitempty" jsonschema:"Max final_text characters. Default 1200; maximum 4000."`
+	Verbose          bool   `json:"verbose,omitempty" jsonschema:"Include bounded raw messages. Default omits."`
+	WaitSeconds      int    `json:"wait_seconds,omitempty" jsonschema:"Wait for completion 0-300s. 0=no wait."`
+	IncludeWorkspace bool   `json:"include_workspace,omitempty" jsonschema:"Attach compact workspace report. Default omits."`
+	MaxFinalChars    int    `json:"max_final_chars,omitempty" jsonschema:"Max final_text chars. Default 1200; max 4000."`
 }
 
 func checkHandler(client *Client, mgr *Manager, workspaces *workspace.Manager) mcp.ToolHandlerFor[checkParams, HandoffCheckResult] {
@@ -738,9 +774,9 @@ func doCheck(ctx context.Context, client *Client, mgr *Manager, args checkParams
 
 type reviewParams struct {
 	SessionID         string `json:"session_id" jsonschema:"opencode session id."`
-	ChangedFileLimit  int    `json:"changed_file_limit,omitempty" jsonschema:"Maximum changed files to return. Defaults to 20; maximum 100."`
-	CommitLimit       int    `json:"commit_limit,omitempty" jsonschema:"Maximum commits to return. Defaults to 10; maximum 50."`
-	VerificationLimit int    `json:"verification_limit,omitempty" jsonschema:"Maximum recent verification results to return. Defaults to 5; maximum 20."`
+	ChangedFileLimit  int    `json:"changed_file_limit,omitempty" jsonschema:"Max changed files. Default 20; max 100."`
+	CommitLimit       int    `json:"commit_limit,omitempty" jsonschema:"Max commits. Default 10; max 50."`
+	VerificationLimit int    `json:"verification_limit,omitempty" jsonschema:"Max recent verifications. Default 5; max 20."`
 }
 
 func reviewHandler(workspaces *workspace.Manager) mcp.ToolHandlerFor[reviewParams, HandoffReviewResult] {

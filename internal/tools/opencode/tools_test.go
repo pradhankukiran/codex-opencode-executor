@@ -448,7 +448,7 @@ func TestRegister(t *testing.T) {
 	mgr := NewManager(t.Context(), client, ManagerOptions{})
 
 	require.NotPanics(t, func() {
-		Register(server, client, mgr, nil, ExecutorOptions{})
+		Register(server, client, mgr, nil, ExecutorOptions{}, ToolsetFull)
 	})
 }
 

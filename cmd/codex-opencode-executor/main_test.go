@@ -112,3 +112,30 @@ func TestLocalEnvironmentPermission(t *testing.T) {
 		cfg.localEnvironment(opencode.PermissionModeYOLO),
 	)
 }
+
+func TestToolsetConfigDefaultAndInvalid(t *testing.T) {
+	t.Parallel()
+
+	t.Run("default full", func(t *testing.T) {
+		t.Parallel()
+		cfg := opencodeCfg{Toolset: ""}
+		toolset, err := opencode.ParseToolset(cfg.Toolset)
+		require.NoError(t, err)
+		require.Equal(t, opencode.ToolsetFull, toolset)
+	})
+
+	t.Run("core", func(t *testing.T) {
+		t.Parallel()
+		cfg := opencodeCfg{Toolset: "core"}
+		toolset, err := opencode.ParseToolset(cfg.Toolset)
+		require.NoError(t, err)
+		require.Equal(t, opencode.ToolsetCore, toolset)
+	})
+
+	t.Run("invalid fails", func(t *testing.T) {
+		t.Parallel()
+		cfg := opencodeCfg{Toolset: "everything"}
+		_, err := opencode.ParseToolset(cfg.Toolset)
+		require.ErrorContains(t, err, "must be core or full")
+	})
+}
