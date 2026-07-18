@@ -13,12 +13,13 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/pradhankukiran/codex-opencode-executor/internal/tools/mcputil"
+	"github.com/pradhankukiran/codex-opencode-executor/internal/workspace"
 )
 
 const maxJobTimeoutSeconds = 24 * 60 * 60
 
 // Register adds opencode handoff tools to an MCP server.
-func Register(s *mcp.Server, client *Client, mgr *Manager, opts ExecutorOptions) {
+func Register(s *mcp.Server, client *Client, mgr *Manager, workspaces *workspace.Manager, opts ExecutorOptions) {
 	mcputil.Register(s, mcputil.ToolDef{
 		Name:        "handoff_health",
 		Description: "Check connectivity to the configured opencode HTTP server. Call this if other handoff tools return connection or authentication errors.",
@@ -45,35 +46,35 @@ func Register(s *mcp.Server, client *Client, mgr *Manager, opts ExecutorOptions)
 
 	mcputil.Register(s, mcputil.ToolDef{
 		Name:        "handoff_create_session",
-		Description: "Create a new opencode session and return its session_id. The configured default model, agent, and permission mode are used unless overridden. Use the returned session_id with handoff_fire to submit prompts.",
-	}, createSessionHandler(client, opts))
+		Description: "Create a new opencode session and return its session_id. Configured model, agent, permission, and workspace-isolation defaults are used unless overridden. Auto isolation uses a worktree for clean Git projects and runs directly otherwise. Use the returned session_id with handoff_fire.",
+	}, createSessionHandler(client, workspaces, opts))
 
 	mcputil.Register(s, mcputil.ToolDef{
 		Name:        "handoff_fire",
 		Description: "Submit a prompt to an existing opencode session and return immediately. The configured default agent is used unless overridden. Requires a session_id from handoff_create_session. Use handoff_check with the session_id to poll progress.",
-	}, fireHandler(client, mgr, opts))
+	}, fireHandler(client, mgr, workspaces, opts))
 
 	mcputil.Register(s, mcputil.ToolDef{
 		Name:        "handoff_check",
 		Description: "Poll progress for a session_id returned by handoff_fire, or inspect sessions for pending permissions/questions.",
 		Flags:       mcputil.ReadOnly,
-	}, checkHandler(client, mgr))
+	}, checkHandler(client, mgr, workspaces))
 
 	mcputil.Register(s, mcputil.ToolDef{
 		Name:        "handoff_cancel",
 		Description: "Cancel active opencode execution for a session. Cancellation is idempotent for jobs already in a terminal state.",
 		Flags:       mcputil.Destructive,
-	}, cancelHandler(mgr))
+	}, cancelHandler(mgr, workspaces))
 
 	mcputil.Register(s, mcputil.ToolDef{
 		Name:        "handoff_permission_reply",
 		Description: "Reply to an opencode permission request for a session. Use handoff_check to see pending permissions.",
-	}, permissionReplyHandler(client))
+	}, permissionReplyHandler(client, workspaces))
 
 	mcputil.Register(s, mcputil.ToolDef{
 		Name:        "handoff_question_reply",
 		Description: "Reply to or reject an opencode clarification question for a session. Use handoff_check to see pending questions.",
-	}, questionReplyHandler(client))
+	}, questionReplyHandler(client, workspaces))
 }
 
 type locationParams struct {
@@ -83,6 +84,13 @@ type locationParams struct {
 
 func (p locationParams) location() Location {
 	return Location(p)
+}
+
+func sessionLocation(workspaces *workspace.Manager, sessionID string, fallback Location) Location {
+	if workspaces != nil {
+		fallback.Directory = workspaces.Resolve(sessionID, fallback.Directory)
+	}
+	return fallback
 }
 
 func healthHandler(client *Client) mcp.ToolHandlerFor[struct{}, HealthResult] {
@@ -199,15 +207,38 @@ type createSessionParams struct {
 	ModelID        string `json:"model_id,omitempty" jsonschema:"Optional model id for compatibility. Must be used with provider_id and cannot be combined with model. Model is fixed for the lifetime of the session."`
 	Agent          string `json:"agent,omitempty" jsonschema:"Optional opencode agent name. Overrides the configured default agent."`
 	PermissionMode string `json:"permission_mode,omitempty" jsonschema:"Optional permission mode: inherit, ask, deny, or yolo. Overrides the configured default for this session."`
+	IsolationMode  string `json:"isolation_mode,omitempty" jsonschema:"Optional workspace isolation: auto, worktree, or none. Auto uses a worktree for clean Git projects and runs directly otherwise."`
 }
 
-func createSessionHandler(client *Client, opts ExecutorOptions) mcp.ToolHandlerFor[createSessionParams, CreateSessionResult] {
+func createSessionHandler(client *Client, workspaces *workspace.Manager, opts ExecutorOptions) mcp.ToolHandlerFor[createSessionParams, CreateSessionResult] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, args createSessionParams) (*mcp.CallToolResult, CreateSessionResult, error) {
 		req, err := opts.sessionRequest(args)
 		if err != nil {
 			return nil, CreateSessionResult{}, err
 		}
-		session, err := client.CreateSession(ctx, args.location(), req)
+		var mode workspace.Mode
+		if strings.TrimSpace(args.IsolationMode) != "" {
+			mode, err = workspace.ParseMode(args.IsolationMode)
+			if err != nil {
+				return nil, CreateSessionResult{}, err
+			}
+		}
+		loc := args.location()
+		var session Session
+		var record *workspace.Record
+		if workspaces == nil {
+			session, err = client.CreateSession(ctx, loc, req)
+		} else {
+			created, openErr := workspaces.Open(ctx, loc.Directory, mode, func(ctx context.Context, directory string) (string, error) {
+				loc.Directory = directory
+				session, err = client.CreateSession(ctx, loc, req)
+				return session.ID, err
+			})
+			err = openErr
+			if openErr == nil {
+				record = &created
+			}
+		}
 		if err != nil {
 			return nil, CreateSessionResult{}, err
 		}
@@ -218,6 +249,7 @@ func createSessionHandler(client *Client, opts ExecutorOptions) mcp.ToolHandlerF
 			Model:          model.String(),
 			Agent:          req.Agent,
 			PermissionMode: string(req.Permission),
+			Workspace:      record,
 		}, nil
 	}
 }
@@ -233,7 +265,7 @@ type fireParams struct {
 	TimeoutSeconds int    `json:"timeout_seconds,omitempty" jsonschema:"Execution deadline in seconds. Zero uses the server default. Maximum 86400 seconds."`
 }
 
-func fireHandler(client *Client, mgr *Manager, opts ExecutorOptions) mcp.ToolHandlerFor[fireParams, HandoffFireResult] {
+func fireHandler(client *Client, mgr *Manager, workspaces *workspace.Manager, opts ExecutorOptions) mcp.ToolHandlerFor[fireParams, HandoffFireResult] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, args fireParams) (*mcp.CallToolResult, HandoffFireResult, error) {
 		if args.SessionID == "" {
 			return nil, HandoffFireResult{}, fmt.Errorf("session_id is required; use handoff_create_session first")
@@ -246,7 +278,8 @@ func fireHandler(client *Client, mgr *Manager, opts ExecutorOptions) mcp.ToolHan
 		if err != nil {
 			return nil, HandoffFireResult{}, err
 		}
-		submission, err := mgr.SubmitJob(ctx, args.location(), args.SessionID, opts.promptRequest(args), submitOpts)
+		loc := sessionLocation(workspaces, args.SessionID, args.location())
+		submission, err := mgr.SubmitJob(ctx, loc, args.SessionID, opts.promptRequest(args), submitOpts)
 		if err != nil {
 			return nil, HandoffFireResult{}, err
 		}
@@ -264,14 +297,14 @@ func fireHandler(client *Client, mgr *Manager, opts ExecutorOptions) mcp.ToolHan
 		if args.WaitSeconds > 0 {
 			waitCtx, cancel := context.WithTimeout(ctx, time.Duration(min(args.WaitSeconds, 300))*time.Second)
 			defer cancel()
-			_ = client.Wait(waitCtx, args.location(), job.SessionID)
+			_ = client.Wait(waitCtx, loc, job.SessionID)
 			if current, ok := mgr.Job(job.SessionID); ok {
 				res.Status = string(current.Status)
 				res.PromptMessageID = current.PromptMessageID
 			}
 		}
 
-		pending := fetchPending(ctx, client, args.location(), job.SessionID)
+		pending := fetchPending(ctx, client, loc, job.SessionID)
 		res.PendingPermissions = pending.Permissions
 		res.PendingQuestions = pending.Questions
 		res.Errors = pending.Errors
@@ -308,14 +341,16 @@ type checkParams struct {
 	WaitSeconds int    `json:"wait_seconds,omitempty" jsonschema:"Max seconds to wait for completion (0-300). 0 = no wait."`
 }
 
-func checkHandler(client *Client, mgr *Manager) mcp.ToolHandlerFor[checkParams, HandoffCheckResult] {
+func checkHandler(client *Client, mgr *Manager, workspaces *workspace.Manager) mcp.ToolHandlerFor[checkParams, HandoffCheckResult] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, args checkParams) (*mcp.CallToolResult, HandoffCheckResult, error) {
+		loc := sessionLocation(workspaces, args.SessionID, args.location())
 		if args.WaitSeconds > 0 {
 			waitCtx, cancel := context.WithTimeout(ctx, time.Duration(min(args.WaitSeconds, 300))*time.Second)
 			defer cancel()
-			_ = client.Wait(waitCtx, args.location(), args.SessionID)
+			_ = client.Wait(waitCtx, loc, args.SessionID)
 		}
 
+		args.Directory = loc.Directory
 		res, err := doCheck(ctx, client, mgr, args)
 		return nil, res, err
 	}
@@ -352,9 +387,9 @@ type cancelParams struct {
 	SessionID string `json:"session_id" jsonschema:"opencode session id to cancel."`
 }
 
-func cancelHandler(mgr *Manager) mcp.ToolHandlerFor[cancelParams, HandoffCancelResult] {
+func cancelHandler(mgr *Manager, workspaces *workspace.Manager) mcp.ToolHandlerFor[cancelParams, HandoffCancelResult] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, args cancelParams) (*mcp.CallToolResult, HandoffCancelResult, error) {
-		result, err := mgr.Cancel(ctx, args.location(), args.SessionID)
+		result, err := mgr.Cancel(ctx, sessionLocation(workspaces, args.SessionID, args.location()), args.SessionID)
 		if err != nil {
 			return nil, HandoffCancelResult{}, err
 		}
@@ -396,9 +431,10 @@ type permissionReplyParams struct {
 	Message   string `json:"message,omitempty" jsonschema:"Optional explanation."`
 }
 
-func permissionReplyHandler(client *Client) mcp.ToolHandlerFor[permissionReplyParams, PermissionReplyResult] {
+func permissionReplyHandler(client *Client, workspaces *workspace.Manager) mcp.ToolHandlerFor[permissionReplyParams, PermissionReplyResult] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, args permissionReplyParams) (*mcp.CallToolResult, PermissionReplyResult, error) {
-		reqs, err := client.SessionPermissionRequests(ctx, args.location(), args.SessionID)
+		loc := sessionLocation(workspaces, args.SessionID, args.location())
+		reqs, err := client.SessionPermissionRequests(ctx, loc, args.SessionID)
 		if err != nil {
 			return nil, PermissionReplyResult{}, err
 		}
@@ -417,13 +453,13 @@ func permissionReplyHandler(client *Client) mcp.ToolHandlerFor[permissionReplyPa
 			return nil, PermissionReplyResult{}, fmt.Errorf("could not extract request ID from pending permission")
 		}
 
-		raw, err := client.PermissionReply(ctx, args.location(), args.SessionID, requestID, args.Reply, args.Message)
+		raw, err := client.PermissionReply(ctx, loc, args.SessionID, requestID, args.Reply, args.Message)
 		if err != nil {
 			return nil, PermissionReplyResult{}, err
 		}
 
 		res := PermissionReplyResult{OK: true, Data: raw}
-		pending := fetchPending(ctx, client, args.location(), args.SessionID)
+		pending := fetchPending(ctx, client, loc, args.SessionID)
 		res.PendingPermissions = pending.Permissions
 		res.PendingQuestions = pending.Questions
 		res.Errors = pending.Errors
@@ -461,9 +497,10 @@ type questionReplyParams struct {
 	Reject    bool       `json:"reject,omitempty" jsonschema:"Reject the question instead of answering it."`
 }
 
-func questionReplyHandler(client *Client) mcp.ToolHandlerFor[questionReplyParams, QuestionReplyResult] {
+func questionReplyHandler(client *Client, workspaces *workspace.Manager) mcp.ToolHandlerFor[questionReplyParams, QuestionReplyResult] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, args questionReplyParams) (*mcp.CallToolResult, QuestionReplyResult, error) {
-		reqs, err := client.SessionQuestionRequests(ctx, args.location(), args.SessionID)
+		loc := sessionLocation(workspaces, args.SessionID, args.location())
+		reqs, err := client.SessionQuestionRequests(ctx, loc, args.SessionID)
 		if err != nil {
 			return nil, QuestionReplyResult{}, err
 		}
@@ -482,13 +519,13 @@ func questionReplyHandler(client *Client) mcp.ToolHandlerFor[questionReplyParams
 			return nil, QuestionReplyResult{}, fmt.Errorf("could not extract request ID from pending question")
 		}
 
-		raw, err := client.QuestionReply(ctx, args.location(), args.SessionID, requestID, args.Reject, args.Answers)
+		raw, err := client.QuestionReply(ctx, loc, args.SessionID, requestID, args.Reject, args.Answers)
 		if err != nil {
 			return nil, QuestionReplyResult{}, err
 		}
 
 		res := QuestionReplyResult{OK: true, Data: raw}
-		pending := fetchPending(ctx, client, args.location(), args.SessionID)
+		pending := fetchPending(ctx, client, loc, args.SessionID)
 		res.PendingPermissions = pending.Permissions
 		res.PendingQuestions = pending.Questions
 		res.Errors = pending.Errors

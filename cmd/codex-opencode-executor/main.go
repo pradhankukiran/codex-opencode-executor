@@ -20,12 +20,14 @@ import (
 
 	"github.com/pradhankukiran/codex-opencode-executor/internal/mcputil"
 	"github.com/pradhankukiran/codex-opencode-executor/internal/tools/opencode"
+	"github.com/pradhankukiran/codex-opencode-executor/internal/workspace"
 )
 
 const (
 	defaultLocalOpencodeURL = "http://localhost:4096"
 	defaultExecutorModel    = "xai/grok-4.5"
 	defaultPermissionMode   = "inherit"
+	defaultIsolationMode    = "auto"
 )
 
 type repeatFlag []string
@@ -53,6 +55,22 @@ func main() {
 		slog.Error("configure executor defaults", "err", err)
 		os.Exit(1)
 	}
+	workspaceMode, err := workspace.ParseMode(ocode.IsolationMode)
+	if err != nil {
+		slog.Error("configure workspace isolation", "err", err)
+		os.Exit(1)
+	}
+	workspaces, err := workspace.NewManager(workspace.Options{
+		Logger:           logger.With("component", "workspace-manager"),
+		StateDir:         ocode.WorkspaceStateDir,
+		WorktreeDir:      ocode.WorktreeDir,
+		DefaultDirectory: ocode.DefaultDirectory,
+		DefaultMode:      workspaceMode,
+	})
+	if err != nil {
+		slog.Error("create workspace manager", "err", err)
+		os.Exit(1)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -74,7 +92,7 @@ func main() {
 		StateDir:       ocode.StateDir,
 		DefaultTimeout: ocode.SyncTimeout,
 	})
-	opencode.Register(s, client, mgr, executorOpts)
+	opencode.Register(s, client, mgr, workspaces, executorOpts)
 
 	if err := s.Run(ctx, &mcp.StdioTransport{}); err != nil {
 		slog.Error("failed to run server", "err", err)
@@ -87,23 +105,38 @@ func envDefault(name, fallback string) string {
 }
 
 func defaultStateDir() string {
+	return defaultCacheDir("jobs")
+}
+
+func defaultWorkspaceStateDir() string {
+	return defaultCacheDir("workspaces")
+}
+
+func defaultWorktreeDir() string {
+	return defaultCacheDir("worktrees")
+}
+
+func defaultCacheDir(name string) string {
 	if dir, err := os.UserCacheDir(); err == nil {
-		return filepath.Join(dir, "codex-opencode-executor", "jobs")
+		return filepath.Join(dir, "codex-opencode-executor", name)
 	}
-	return ""
+	return filepath.Join(os.TempDir(), "codex-opencode-executor", name)
 }
 
 type opencodeCfg struct {
-	Mode             string
-	DefaultDirectory string
-	RequestTimeout   time.Duration
-	SyncTimeout      time.Duration
-	StateDir         string
-	LogAPI           bool
-	DefaultModel     string
-	DefaultAgent     string
-	PermissionMode   string
-	YOLO             bool
+	Mode              string
+	DefaultDirectory  string
+	RequestTimeout    time.Duration
+	SyncTimeout       time.Duration
+	StateDir          string
+	WorkspaceStateDir string
+	WorktreeDir       string
+	IsolationMode     string
+	LogAPI            bool
+	DefaultModel      string
+	DefaultAgent      string
+	PermissionMode    string
+	YOLO              bool
 
 	BaseURL  string
 	Username string
@@ -117,8 +150,11 @@ func (o *opencodeCfg) Register(_ *flag.FlagSet) {
 	flag.StringVar(&o.Mode, "mode", os.Getenv("OPENCODE_MODE"), "opencode connection mode: local or remote; auto-selects local when -opencode-url is empty (env: OPENCODE_MODE)")
 	flag.StringVar(&o.DefaultDirectory, "default-directory", os.Getenv("OPENCODE_DIRECTORY"), "default x-opencode-directory value (env: OPENCODE_DIRECTORY)")
 	flag.DurationVar(&o.RequestTimeout, "request-timeout", 30*time.Second, "timeout for regular opencode HTTP calls")
-	flag.DurationVar(&o.SyncTimeout, "sync-timeout", 5*time.Minute, "timeout for blocking prompt calls (session message POST) used by handoff_run and handoff_fire")
+	flag.DurationVar(&o.SyncTimeout, "sync-timeout", 5*time.Minute, "timeout for blocking prompt calls (session message POST) used by handoff_fire")
 	flag.StringVar(&o.StateDir, "state-dir", envDefault("CODEX_OPENCODE_EXECUTOR_STATE_DIR", defaultStateDir()), "directory for persisting job state across restarts (env: CODEX_OPENCODE_EXECUTOR_STATE_DIR)")
+	flag.StringVar(&o.WorkspaceStateDir, "workspace-state-dir", envDefault("CODEX_OPENCODE_EXECUTOR_WORKSPACE_STATE_DIR", defaultWorkspaceStateDir()), "directory for persisting session workspace state (env: CODEX_OPENCODE_EXECUTOR_WORKSPACE_STATE_DIR)")
+	flag.StringVar(&o.WorktreeDir, "worktree-dir", envDefault("CODEX_OPENCODE_EXECUTOR_WORKTREE_DIR", defaultWorktreeDir()), "parent directory for executor-owned Git worktrees (env: CODEX_OPENCODE_EXECUTOR_WORKTREE_DIR)")
+	flag.StringVar(&o.IsolationMode, "isolation-mode", envDefault("CODEX_OPENCODE_EXECUTOR_ISOLATION_MODE", defaultIsolationMode), "default workspace isolation: auto, worktree, or none (env: CODEX_OPENCODE_EXECUTOR_ISOLATION_MODE)")
 	flag.StringVar(&o.DefaultModel, "default-model", envDefault("CODEX_OPENCODE_EXECUTOR_DEFAULT_MODEL", defaultExecutorModel), "default model for new sessions in provider/model form; pass an empty value to use opencode's default (env: CODEX_OPENCODE_EXECUTOR_DEFAULT_MODEL)")
 	flag.StringVar(&o.DefaultAgent, "default-agent", os.Getenv("CODEX_OPENCODE_EXECUTOR_DEFAULT_AGENT"), "default opencode agent for new sessions and prompts; empty uses opencode's default (env: CODEX_OPENCODE_EXECUTOR_DEFAULT_AGENT)")
 	flag.StringVar(&o.PermissionMode, "permission-mode", envDefault("CODEX_OPENCODE_EXECUTOR_PERMISSION_MODE", defaultPermissionMode), "default permission mode for new sessions: inherit, ask, deny, or yolo (env: CODEX_OPENCODE_EXECUTOR_PERMISSION_MODE)")

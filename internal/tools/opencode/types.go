@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"log/slog"
 	"time"
+
+	"github.com/pradhankukiran/codex-opencode-executor/internal/workspace"
 )
 
 // Config contains connection settings for an opencode HTTP server.
@@ -96,11 +98,12 @@ type PromptPayload struct {
 }
 
 type CreateSessionResult struct {
-	SessionID      string `json:"session_id"`
-	Title          string `json:"title,omitempty"`
-	Model          string `json:"model,omitempty"`
-	Agent          string `json:"agent,omitempty"`
-	PermissionMode string `json:"permission_mode,omitempty"`
+	SessionID      string            `json:"session_id"`
+	Title          string            `json:"title,omitempty"`
+	Model          string            `json:"model,omitempty"`
+	Agent          string            `json:"agent,omitempty"`
+	PermissionMode string            `json:"permission_mode,omitempty"`
+	Workspace      *workspace.Record `json:"workspace,omitempty"`
 }
 
 type HandoffFireResult struct {

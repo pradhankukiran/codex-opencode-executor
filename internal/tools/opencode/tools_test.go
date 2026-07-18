@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -16,7 +17,62 @@ import (
 	"github.com/stretchr/testify/require"
 
 	opencodeapi "github.com/pradhankukiran/codex-opencode-executor/internal/tools/opencode/opencodeapi"
+	"github.com/pradhankukiran/codex-opencode-executor/internal/workspace"
 )
+
+func TestCreateSessionBindsIsolatedWorkspace(t *testing.T) {
+	repository := t.TempDir()
+	runGit(t, repository, "init")
+	runGit(t, repository, "config", "user.name", "Test User")
+	runGit(t, repository, "config", "user.email", "test@example.com")
+	require.NoError(t, os.WriteFile(filepath.Join(repository, "file.txt"), []byte("base\n"), 0o600))
+	runGit(t, repository, "add", "file.txt")
+	runGit(t, repository, "commit", "-m", "base")
+
+	var createDirectory string
+	handler := &HandlerMock{
+		SessionCreateFunc: func(_ context.Context, _ opencodeapi.OptSessionCreateReq, params opencodeapi.SessionCreateParams) (opencodeapi.SessionCreateRes, error) {
+			createDirectory = params.Directory.Value
+			return &opencodeapi.Session{ID: "session-isolated", Title: "Isolated"}, nil
+		},
+	}
+	client := setupTestServer(t, handler)
+	workspaces, err := workspace.NewManager(workspace.Options{
+		StateDir:    filepath.Join(t.TempDir(), "state"),
+		WorktreeDir: filepath.Join(t.TempDir(), "worktrees"),
+		DefaultMode: workspace.ModeAuto,
+	})
+	require.NoError(t, err)
+
+	h := createSessionHandler(client, workspaces, ExecutorOptions{})
+	_, result, err := h(t.Context(), nil, createSessionParams{
+		locationParams: locationParams{Directory: repository},
+		Title:          "Isolated",
+	})
+	require.NoError(t, err)
+	require.NotNil(t, result.Workspace)
+	require.Equal(t, workspace.ModeWorktree, result.Workspace.Mode)
+	require.Equal(t, result.Workspace.Directory, createDirectory)
+	require.NotEqual(t, repository, createDirectory)
+	require.Equal(t, createDirectory, sessionLocation(workspaces, result.SessionID, Location{Directory: repository}).Directory)
+
+	directWorkspaces, err := workspace.NewManager(workspace.Options{DefaultMode: workspace.ModeNone})
+	require.NoError(t, err)
+	directHandler := createSessionHandler(client, directWorkspaces, ExecutorOptions{})
+	_, direct, err := directHandler(t.Context(), nil, createSessionParams{
+		locationParams: locationParams{Directory: repository},
+	})
+	require.NoError(t, err)
+	require.Equal(t, workspace.ModeNone, direct.Workspace.Mode)
+	require.Equal(t, repository, createDirectory)
+}
+
+func runGit(t *testing.T, directory string, args ...string) {
+	t.Helper()
+	argv := append([]string{"-C", directory}, args...)
+	output, err := exec.Command("git", argv...).CombinedOutput()
+	require.NoError(t, err, string(output))
+}
 
 func TestManagerJobsReturnsSnapshots(t *testing.T) {
 	t.Parallel()
@@ -105,7 +161,7 @@ func TestRegister(t *testing.T) {
 	mgr := NewManager(t.Context(), client, ManagerOptions{})
 
 	require.NotPanics(t, func() {
-		Register(server, client, mgr, ExecutorOptions{})
+		Register(server, client, mgr, nil, ExecutorOptions{})
 	})
 }
 
@@ -304,7 +360,7 @@ func TestToolHandlers(t *testing.T) {
 
 	// 5. createSessionHandler
 	{
-		h := createSessionHandler(client, ExecutorOptions{
+		h := createSessionHandler(client, nil, ExecutorOptions{
 			DefaultModel:      ModelRef{ProviderID: "xai", ModelID: "grok-4.5"},
 			DefaultAgent:      "build",
 			DefaultPermission: PermissionModeYOLO,
@@ -319,7 +375,7 @@ func TestToolHandlers(t *testing.T) {
 
 	// 6. fireHandler
 	{
-		h := fireHandler(client, mgr, ExecutorOptions{})
+		h := fireHandler(client, mgr, nil, ExecutorOptions{})
 		args := fireParams{
 			SessionID:      "ses-123",
 			Prompt:         "hello",
@@ -340,7 +396,7 @@ func TestToolHandlers(t *testing.T) {
 
 	// 7. permissionReplyHandler
 	{
-		h := permissionReplyHandler(client)
+		h := permissionReplyHandler(client, nil)
 		_, res, err := h(t.Context(), nil, permissionReplyParams{SessionID: "ses-123", Reply: "once"})
 		require.NoError(t, err)
 		require.True(t, res.OK)
@@ -348,7 +404,7 @@ func TestToolHandlers(t *testing.T) {
 
 	// 8. questionReplyHandler
 	{
-		h := questionReplyHandler(client)
+		h := questionReplyHandler(client, nil)
 		_, res, err := h(t.Context(), nil, questionReplyParams{SessionID: "ses-123", Answers: [][]string{{"ans1"}}})
 		require.NoError(t, err)
 		require.True(t, res.OK)
@@ -356,7 +412,7 @@ func TestToolHandlers(t *testing.T) {
 
 	// 9. checkHandler
 	{
-		h := checkHandler(client, mgr)
+		h := checkHandler(client, mgr, nil)
 		_, res, err := h(t.Context(), nil, checkParams{SessionID: "ses-123"})
 		require.NoError(t, err)
 		require.Equal(t, "ses-123", res.SessionID)
@@ -369,7 +425,7 @@ func TestToolHandlers(t *testing.T) {
 				return true, nil
 			},
 		}, ManagerOptions{})
-		h := cancelHandler(cancelMgr)
+		h := cancelHandler(cancelMgr, nil)
 		_, res, err := h(t.Context(), nil, cancelParams{SessionID: "ses-external"})
 		require.NoError(t, err)
 		require.Equal(t, "ses-external", res.SessionID)
