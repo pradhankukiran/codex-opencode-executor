@@ -18,6 +18,181 @@ func firstText(raw json.RawMessage) string {
 	return texts[len(texts)-1]
 }
 
+// finalAssistantAnswerText returns only completed assistant answer text from an
+// OpenCode message list. It never falls back to user prompts, and skips
+// reasoning/thinking/tool parts when part types are present.
+//
+// When requireFinished is true, the chosen assistant message must expose a
+// non-empty finish field (session still running / incomplete turn → "").
+func finalAssistantAnswerText(raw json.RawMessage, requireFinished bool) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return ""
+	}
+	var lastAnswer string
+	for _, item := range collectObjects(nil, v) {
+		if messageRole(item) != "assistant" {
+			continue
+		}
+		if requireFinished && !messageFinished(item) {
+			continue
+		}
+		if answer := assistantAnswerText(item); answer != "" {
+			lastAnswer = answer
+		}
+	}
+	return lastAnswer
+}
+
+// shapeHandoffCheckResult centralizes handoff_check final_text/messages policy
+// so status and verbosity cannot diverge across checkSession/doCheck callers.
+//
+// Rules:
+//   - verbose=false → omit messages for every status
+//   - verbose=true  → bounded raw messages (including while running)
+//   - running/unknown → never set final_text
+//   - done → final_text from final assistant answer text only
+//   - error/canceled/timed_out → final_text only when a finished assistant answer exists
+//   - untracked uses the same rules via status done|running from isFinished
+func shapeHandoffCheckResult(res HandoffCheckResult, msg json.RawMessage, verbose bool, isFinished bool) HandoffCheckResult {
+	res.Messages = nil
+	res.FinalText = ""
+
+	if verbose && len(msg) > 0 {
+		res.Messages = summarizeMessages(msg, 6)
+	}
+
+	switch JobStatus(res.Status) {
+	case JobRunning, JobUnknown:
+		return res
+	case JobDone:
+		if len(msg) > 0 {
+			// Job/session completion is authoritative; still never use user/tool/reasoning text.
+			res.FinalText = truncateText(finalAssistantAnswerText(msg, false), 4000)
+		}
+		return res
+	case JobError, JobCanceled, JobTimedOut:
+		if len(msg) > 0 {
+			res.FinalText = truncateText(finalAssistantAnswerText(msg, true), 4000)
+		}
+		return res
+	default:
+		// Untracked / unknown status strings: only emit final_text when finished.
+		if isFinished && len(msg) > 0 {
+			res.FinalText = truncateText(finalAssistantAnswerText(msg, true), 4000)
+		}
+		return res
+	}
+}
+
+func messageFinished(m map[string]any) bool {
+	if finish := stringField(m, "finish"); finish != "" {
+		return true
+	}
+	if info, ok := m["info"].(map[string]any); ok {
+		if finish := stringField(info, "finish"); finish != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func assistantAnswerText(m map[string]any) string {
+	parts := assistantPartValues(m)
+	if len(parts) == 0 {
+		// Flat/legacy shapes without parts: take direct text only, never nested tool blocks.
+		if text := strings.TrimSpace(stringField(m, "text")); text != "" {
+			if typ := stringField(m, "type"); typ == "" || isAnswerPartType(typ) {
+				return text
+			}
+		}
+		return ""
+	}
+	var texts []string
+	for _, part := range parts {
+		if !isAnswerPart(part) {
+			continue
+		}
+		if text := strings.TrimSpace(stringField(part, "text")); text != "" {
+			texts = append(texts, text)
+		}
+	}
+	return strings.Join(texts, "\n")
+}
+
+func assistantPartValues(m map[string]any) []map[string]any {
+	for _, key := range []string{"parts", "content"} {
+		raw, ok := m[key]
+		if !ok {
+			continue
+		}
+		arr, ok := raw.([]any)
+		if !ok {
+			continue
+		}
+		out := make([]map[string]any, 0, len(arr))
+		for _, child := range arr {
+			if part, ok := child.(map[string]any); ok {
+				out = append(out, part)
+			}
+		}
+		if len(out) > 0 {
+			return out
+		}
+	}
+	return nil
+}
+
+func isAnswerPart(part map[string]any) bool {
+	typ := stringField(part, "type")
+	if typ == "" {
+		// Untyped part with text is treated as answer text only when it is not a tool payload.
+		if stringField(part, "tool") != "" || part["state"] != nil || part["input"] != nil || part["output"] != nil {
+			return false
+		}
+		return strings.TrimSpace(stringField(part, "text")) != ""
+	}
+	if !isAnswerPartType(typ) {
+		return false
+	}
+	// Drop incomplete fragments when the API exposes a non-terminal part status.
+	if status := partStatus(part); status != "" && !isTerminalPartStatus(status) {
+		return false
+	}
+	return true
+}
+
+func isAnswerPartType(typ string) bool {
+	switch strings.ToLower(strings.TrimSpace(typ)) {
+	case "text", "output_text", "answer":
+		return true
+	default:
+		return false
+	}
+}
+
+func partStatus(part map[string]any) string {
+	if status := stringField(part, "status"); status != "" {
+		return status
+	}
+	if state, ok := part["state"].(map[string]any); ok {
+		return stringField(state, "status")
+	}
+	return ""
+}
+
+func isTerminalPartStatus(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "completed", "complete", "done", "finished", "success", "succeeded":
+		return true
+	default:
+		return false
+	}
+}
+
 func summarizeMessages(raw json.RawMessage, limit int) []MessageSummary {
 	if limit <= 0 {
 		limit = 6

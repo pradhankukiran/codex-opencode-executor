@@ -368,7 +368,7 @@ func submitOptions(args fireParams) (SubmitOptions, error) {
 type checkParams struct {
 	locationParams
 	SessionID   string `json:"session_id" jsonschema:"opencode session id."`
-	Verbose     bool   `json:"verbose,omitempty" jsonschema:"Include raw messages/context returned by opencode."`
+	Verbose     bool   `json:"verbose,omitempty" jsonschema:"Include bounded raw messages for diagnostics. Default omits messages. final_text is only set for completed assistant answers, never for in-progress polls."`
 	WaitSeconds int    `json:"wait_seconds,omitempty" jsonschema:"Max seconds to wait for completion (0-300). 0 = no wait."`
 }
 
@@ -407,7 +407,7 @@ func doCheck(ctx context.Context, client *Client, mgr *Manager, args checkParams
 	loc := args.location()
 	_, tracked := mgr.Job(args.SessionID)
 
-	res, isFinished, err := checkSession(ctx, client, loc, args.SessionID, args.Verbose)
+	res, msg, isFinished, err := checkSession(ctx, client, loc, args.SessionID)
 	if err != nil {
 		return HandoffCheckResult{}, err
 	}
@@ -416,7 +416,7 @@ func doCheck(ctx context.Context, client *Client, mgr *Manager, args checkParams
 	// whatever opencode says and surface any pending permissions/questions.
 	if !tracked {
 		res.Status = sessionStatus(isFinished)
-		return res, nil
+		return shapeHandoffCheckResult(res, msg, args.Verbose, isFinished), nil
 	}
 
 	job, _ := mgr.Reconcile(args.SessionID, isFinished)
@@ -426,7 +426,7 @@ func doCheck(ctx context.Context, client *Client, mgr *Manager, args checkParams
 	if job.Err != nil {
 		res.JobError = job.Err.Error()
 	}
-	return res, nil
+	return shapeHandoffCheckResult(res, msg, args.Verbose, isFinished), nil
 }
 
 type cancelParams struct {
@@ -729,33 +729,23 @@ func questionReplyHandler(client *Client, workspaces *workspace.Manager) mcp.Too
 	}
 }
 
-func checkSession(ctx context.Context, client *Client, loc Location, sessionID string, verbose bool) (HandoffCheckResult, bool, error) {
+// checkSession loads OpenCode session signals needed by handoff_check.
+// It deliberately does not set final_text/messages; callers must run
+// shapeHandoffCheckResult after status is known so running polls cannot leak
+// partial assistant content into Codex context.
+func checkSession(ctx context.Context, client *Client, loc Location, sessionID string) (HandoffCheckResult, json.RawMessage, bool, error) {
 	if sessionID == "" {
-		return HandoffCheckResult{}, false, fmt.Errorf("session_id is required")
+		return HandoffCheckResult{}, nil, false, fmt.Errorf("session_id is required")
 	}
 	res := HandoffCheckResult{SessionID: sessionID}
-	var isFinished bool
 	msg, msgErr := client.Messages(ctx, loc, sessionID)
-	if msgErr == nil {
-		limit := 3
-		if verbose {
-			limit = 6
-		}
-		res.Messages = summarizeMessages(msg, limit)
-		res.FinalText = truncateText(firstText(msg), 4000)
-		isFinished = isSessionFinishedJSON(msg)
+	if msgErr != nil {
+		fillPendingRequests(ctx, client, loc, &res)
+		return HandoffCheckResult{}, nil, false, fmt.Errorf("read session %q messages: %w", sessionID, msgErr)
 	}
-	ctxData, ctxErr := client.Context(ctx, loc, sessionID)
-	if ctxErr == nil {
-		if res.FinalText == "" {
-			res.FinalText = truncateText(firstText(ctxData), 4000)
-		}
-	}
+	isFinished := isSessionFinishedJSON(msg)
 	fillPendingRequests(ctx, client, loc, &res)
-	if msgErr != nil && ctxErr != nil {
-		return HandoffCheckResult{}, false, fmt.Errorf("read session %q messages: %w; context: %w", sessionID, msgErr, ctxErr)
-	}
-	return res, isFinished, nil
+	return res, msg, isFinished, nil
 }
 
 func fillPendingRequests(ctx context.Context, client *Client, loc Location, res *HandoffCheckResult) {
