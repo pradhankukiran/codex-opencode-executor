@@ -59,6 +59,15 @@ func Register(s *mcp.Server, client *Client, mgr *Manager, workspaces *workspace
 	}, fireHandler(client, mgr, workspaces, opts))
 
 	mcputil.Register(s, mcputil.ToolDef{
+		Name: "handoff_execute",
+		Description: "Deep routine-delegation tool: create a session, submit a prompt, wait for completion, and return a compact final check (plus optional compact review). " +
+			"Preserves low-level tools for finer control. Default wait is 300s; set async=true for immediate return after submit. " +
+			"On wait expiry returns status=running with session_id for handoff_check (not an error). " +
+			"Server-owned profile suffixes shape executor behavior without overriding the caller's task details. " +
+			"idempotency_key is submission-scoped after session creation only — it does not make the whole execute operation retry-idempotent.",
+	}, executeHandler(client, mgr, workspaces, opts))
+
+	mcputil.Register(s, mcputil.ToolDef{
 		Name:        "handoff_check",
 		Description: "Poll progress for a session_id from handoff_fire. Omits workspace data by default; set include_workspace=true to attach a compact report. final_text is terminal-only and bounded (default 1200 chars).",
 		Flags:       mcputil.ReadOnly,
@@ -273,53 +282,60 @@ type createSessionParams struct {
 
 func createSessionHandler(client *Client, workspaces *workspace.Manager, opts ExecutorOptions) mcp.ToolHandlerFor[createSessionParams, CreateSessionResult] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, args createSessionParams) (*mcp.CallToolResult, CreateSessionResult, error) {
-		req, err := opts.sessionRequest(args)
-		if err != nil {
-			return nil, CreateSessionResult{}, err
-		}
-		var mode workspace.Mode
-		if strings.TrimSpace(args.IsolationMode) != "" {
-			mode, err = workspace.ParseMode(args.IsolationMode)
-			if err != nil {
-				return nil, CreateSessionResult{}, err
-			}
-		}
-		loc := args.location()
-		var session Session
-		var record *workspace.Record
-		if workspaces == nil {
-			if args.CreateDirectory {
-				return nil, CreateSessionResult{}, fmt.Errorf("create_directory requires workspace management")
-			}
-			session, err = client.CreateSession(ctx, loc, req)
-		} else {
-			created, openErr := workspaces.Open(ctx, workspace.OpenOptions{
-				Directory:       loc.Directory,
-				Mode:            mode,
-				CreateDirectory: args.CreateDirectory,
-			}, func(ctx context.Context, directory string) (string, error) {
-				loc.Directory = directory
-				session, err = client.CreateSession(ctx, loc, req)
-				return session.ID, err
-			})
-			err = openErr
-			if openErr == nil {
-				record = &created
-			}
-		}
-		if err != nil {
-			return nil, CreateSessionResult{}, err
-		}
-		model := ModelRef{ProviderID: req.ProviderID, ModelID: req.ModelID}
-		return nil, CreateSessionResult{
-			SessionID:      session.ID,
-			Title:          session.Title,
-			Model:          model.String(),
-			Agent:          req.Agent,
-			PermissionMode: string(req.Permission),
-			Workspace:      record,
-		}, nil
+		res, err := createSession(ctx, client, workspaces, opts, args)
+		return nil, res, err
 	}
+}
+
+// createSession opens an optional workspace binding and creates an opencode session.
+// Shared by handoff_create_session and handoff_execute so create semantics stay singular.
+func createSession(ctx context.Context, client *Client, workspaces *workspace.Manager, opts ExecutorOptions, args createSessionParams) (CreateSessionResult, error) {
+	req, err := opts.sessionRequest(args)
+	if err != nil {
+		return CreateSessionResult{}, err
+	}
+	var mode workspace.Mode
+	if strings.TrimSpace(args.IsolationMode) != "" {
+		mode, err = workspace.ParseMode(args.IsolationMode)
+		if err != nil {
+			return CreateSessionResult{}, err
+		}
+	}
+	loc := args.location()
+	var session Session
+	var record *workspace.Record
+	if workspaces == nil {
+		if args.CreateDirectory {
+			return CreateSessionResult{}, fmt.Errorf("create_directory requires workspace management")
+		}
+		session, err = client.CreateSession(ctx, loc, req)
+	} else {
+		created, openErr := workspaces.Open(ctx, workspace.OpenOptions{
+			Directory:       loc.Directory,
+			Mode:            mode,
+			CreateDirectory: args.CreateDirectory,
+		}, func(ctx context.Context, directory string) (string, error) {
+			loc.Directory = directory
+			session, err = client.CreateSession(ctx, loc, req)
+			return session.ID, err
+		})
+		err = openErr
+		if openErr == nil {
+			record = &created
+		}
+	}
+	if err != nil {
+		return CreateSessionResult{}, err
+	}
+	model := ModelRef{ProviderID: req.ProviderID, ModelID: req.ModelID}
+	return CreateSessionResult{
+		SessionID:      session.ID,
+		Title:          session.Title,
+		Model:          model.String(),
+		Agent:          req.Agent,
+		PermissionMode: string(req.Permission),
+		Workspace:      record,
+	}, nil
 }
 
 type fireParams struct {
@@ -335,19 +351,7 @@ type fireParams struct {
 
 func fireHandler(client *Client, mgr *Manager, workspaces *workspace.Manager, opts ExecutorOptions) mcp.ToolHandlerFor[fireParams, HandoffFireResult] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, args fireParams) (*mcp.CallToolResult, HandoffFireResult, error) {
-		if args.SessionID == "" {
-			return nil, HandoffFireResult{}, fmt.Errorf("session_id is required; use handoff_create_session first")
-		}
-		if args.Prompt == "" {
-			return nil, HandoffFireResult{}, fmt.Errorf("prompt is required")
-		}
-
-		submitOpts, err := submitOptions(args)
-		if err != nil {
-			return nil, HandoffFireResult{}, err
-		}
-		loc := sessionLocation(workspaces, args.SessionID, args.location())
-		submission, err := mgr.SubmitJob(ctx, loc, args.SessionID, opts.promptRequest(args), submitOpts)
+		submission, loc, err := submitFire(ctx, mgr, workspaces, opts, args)
 		if err != nil {
 			return nil, HandoffFireResult{}, err
 		}
@@ -389,6 +393,216 @@ func fireHandler(client *Client, mgr *Manager, workspaces *workspace.Manager, op
 
 		return nil, res, nil
 	}
+}
+
+// submitFire validates and submits a prompt job for an existing session.
+// Shared by handoff_fire and handoff_execute so fire semantics stay singular.
+func submitFire(ctx context.Context, mgr *Manager, workspaces *workspace.Manager, opts ExecutorOptions, args fireParams) (SubmitResult, Location, error) {
+	if args.SessionID == "" {
+		return SubmitResult{}, Location{}, fmt.Errorf("session_id is required; use handoff_create_session first")
+	}
+	if args.Prompt == "" {
+		return SubmitResult{}, Location{}, fmt.Errorf("prompt is required")
+	}
+	submitOpts, err := submitOptions(args)
+	if err != nil {
+		return SubmitResult{}, Location{}, err
+	}
+	loc := sessionLocation(workspaces, args.SessionID, args.location())
+	submission, err := mgr.SubmitJob(ctx, loc, args.SessionID, opts.promptRequest(args), submitOpts)
+	if err != nil {
+		return SubmitResult{}, Location{}, err
+	}
+	return submission, loc, nil
+}
+
+const (
+	defaultExecuteWaitSeconds = 300
+	maxExecuteWaitSeconds     = 300
+
+	executeProfileImplementation = "implementation"
+	executeProfileDiagnosis      = "diagnosis"
+	executeProfileReview         = "review"
+	executeProfileNone           = "none"
+
+	executeProfileSuffixImplementation = "Follow repository instructions. Make the requested changes. Run relevant validation. Commit cohesive logical units. Finish with concise status, commits, files, tests, and blockers."
+	executeProfileSuffixDiagnosis      = "Read-only: do not mutate files, git state, or configuration. Diagnose only. Report concise evidence."
+	executeProfileSuffixReview         = "Read-only: do not mutate files, git state, or configuration. Review only. Report concise evidence."
+)
+
+type executeParams struct {
+	createSessionParams
+	Prompt         string `json:"prompt" jsonschema:"Task to delegate to opencode. Profile suffixes are appended by the server and never replace this text."`
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty" jsonschema:"Execution deadline in seconds. Zero uses the server default. Maximum 86400 seconds."`
+	// WaitSeconds uses a pointer so omitted (default 300) differs from explicit 0.
+	WaitSeconds    *int   `json:"wait_seconds,omitempty" jsonschema:"Max seconds to wait after submit (0-300). Omitted defaults to 300. Use async=true for immediate return after submit."`
+	Async          bool   `json:"async,omitempty" jsonschema:"If true, return immediately after submit (equivalent to wait_seconds=0). Use handoff_check with the returned session_id to poll."`
+	MaxFinalChars  int    `json:"max_final_chars,omitempty" jsonschema:"Max final_text characters. Default 1200; maximum 4000."`
+	Profile        string `json:"profile,omitempty" jsonschema:"Server-owned concise suffix: implementation (default), diagnosis, review, or none. none passes the user prompt unchanged."`
+	IdempotencyKey string `json:"idempotency_key,omitempty" jsonschema:"Optional retry key scoped only to job submission after session creation. Does not make the whole handoff_execute call retry-idempotent; a retry creates a new session."`
+	SkipReview     bool   `json:"skip_review,omitempty" jsonschema:"If true, omit the compact review block even after terminal completion."`
+}
+
+// resolveExecuteWaitSeconds maps async/wait_seconds to a concrete wait budget.
+// Omitted wait_seconds defaults to 300; explicit values are bounded to 0-300.
+// async forces an immediate return (0). Exposed for tests without sleeping.
+func resolveExecuteWaitSeconds(async bool, waitSeconds *int) (int, error) {
+	if async {
+		return 0, nil
+	}
+	if waitSeconds == nil {
+		return defaultExecuteWaitSeconds, nil
+	}
+	if *waitSeconds < 0 || *waitSeconds > maxExecuteWaitSeconds {
+		return 0, fmt.Errorf("wait_seconds must be between 0 and %d", maxExecuteWaitSeconds)
+	}
+	return *waitSeconds, nil
+}
+
+func applyExecuteProfile(prompt, profile string) (string, error) {
+	profile = strings.TrimSpace(profile)
+	if profile == "" {
+		profile = executeProfileImplementation
+	}
+	switch profile {
+	case executeProfileNone:
+		return prompt, nil
+	case executeProfileImplementation:
+		return prompt + "\n\n" + executeProfileSuffixImplementation, nil
+	case executeProfileDiagnosis:
+		return prompt + "\n\n" + executeProfileSuffixDiagnosis, nil
+	case executeProfileReview:
+		return prompt + "\n\n" + executeProfileSuffixReview, nil
+	default:
+		return "", fmt.Errorf("profile must be one of: implementation, diagnosis, review, none")
+	}
+}
+
+// preparedExecute holds fully validated execute inputs so createSession is never
+// called with invalid arguments (no leftover workspace/session on bad input).
+type preparedExecute struct {
+	create        createSessionParams
+	prompt        string
+	waitSeconds   int
+	maxFinalChars int
+	fire          fireParams
+}
+
+func prepareExecute(args executeParams, workspaces *workspace.Manager, opts ExecutorOptions) (preparedExecute, error) {
+	if strings.TrimSpace(args.Prompt) == "" {
+		return preparedExecute{}, fmt.Errorf("prompt is required")
+	}
+	waitSeconds, err := resolveExecuteWaitSeconds(args.Async, args.WaitSeconds)
+	if err != nil {
+		return preparedExecute{}, err
+	}
+	maxFinalChars, err := boundedLimit("max_final_chars", args.MaxFinalChars, defaultFinalTextChars, maxFinalTextChars)
+	if err != nil {
+		return preparedExecute{}, err
+	}
+	prompt, err := applyExecuteProfile(args.Prompt, args.Profile)
+	if err != nil {
+		return preparedExecute{}, err
+	}
+	if args.CreateDirectory && workspaces == nil {
+		return preparedExecute{}, fmt.Errorf("create_directory requires workspace management")
+	}
+	if _, err := opts.sessionRequest(args.createSessionParams); err != nil {
+		return preparedExecute{}, err
+	}
+	if strings.TrimSpace(args.IsolationMode) != "" {
+		if _, err := workspace.ParseMode(args.IsolationMode); err != nil {
+			return preparedExecute{}, err
+		}
+	}
+	fire := fireParams{
+		locationParams: args.locationParams,
+		Prompt:         prompt,
+		Agent:          args.Agent,
+		IdempotencyKey: args.IdempotencyKey,
+		TimeoutSeconds: args.TimeoutSeconds,
+	}
+	if _, err := submitOptions(fire); err != nil {
+		return preparedExecute{}, err
+	}
+	return preparedExecute{
+		create:        args.createSessionParams,
+		prompt:        prompt,
+		waitSeconds:   waitSeconds,
+		maxFinalChars: maxFinalChars,
+		fire:          fire,
+	}, nil
+}
+
+func executeHandler(client *Client, mgr *Manager, workspaces *workspace.Manager, opts ExecutorOptions) mcp.ToolHandlerFor[executeParams, HandoffExecuteResult] {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, args executeParams) (*mcp.CallToolResult, HandoffExecuteResult, error) {
+		prepared, err := prepareExecute(args, workspaces, opts)
+		if err != nil {
+			return nil, HandoffExecuteResult{}, err
+		}
+
+		created, err := createSession(ctx, client, workspaces, opts, prepared.create)
+		if err != nil {
+			return nil, HandoffExecuteResult{}, err
+		}
+
+		fireArgs := prepared.fire
+		fireArgs.SessionID = created.SessionID
+		if fireArgs.Agent == "" {
+			fireArgs.Agent = created.Agent
+		}
+		_, loc, err := submitFire(ctx, mgr, workspaces, opts, fireArgs)
+		if err != nil {
+			return nil, HandoffExecuteResult{}, err
+		}
+
+		if prepared.waitSeconds > 0 {
+			waitCtx, cancel := context.WithTimeout(ctx, time.Duration(prepared.waitSeconds)*time.Second)
+			defer cancel()
+			waitForHandoffCheck(waitCtx, client, mgr, loc, created.SessionID)
+		}
+
+		checkArgs := checkParams{
+			locationParams: locationParams{Directory: loc.Directory, Workspace: loc.Workspace},
+			SessionID:      created.SessionID,
+			MaxFinalChars:  prepared.maxFinalChars,
+		}
+		checked, err := doCheck(ctx, client, mgr, checkArgs)
+		if err != nil {
+			return nil, HandoffExecuteResult{}, err
+		}
+
+		out := HandoffExecuteResult{
+			SessionID:          created.SessionID,
+			Status:             checked.Status,
+			Model:              created.Model,
+			Agent:              created.Agent,
+			FinalText:          checked.FinalText,
+			FinalTextTruncated: checked.FinalTextTruncated,
+			PendingPermissions: checked.PendingPermissions,
+			PendingQuestions:   checked.PendingQuestions,
+			JobError:           checked.JobError,
+			Errors:             checked.Errors,
+		}
+
+		if !args.SkipReview && JobStatus(checked.Status).terminal() {
+			if review, ok := loadExecuteReview(ctx, workspaces, created.SessionID); ok {
+				out.Review = &review
+			}
+		}
+		return nil, out, nil
+	}
+}
+
+func loadExecuteReview(ctx context.Context, workspaces *workspace.Manager, sessionID string) (HandoffReviewResult, bool) {
+	if workspaces == nil {
+		return HandoffReviewResult{}, false
+	}
+	report, ok, err := workspaces.Inspect(ctx, sessionID)
+	if err != nil || !ok {
+		return HandoffReviewResult{}, false
+	}
+	return shapeHandoffReview(sessionID, report, 20, 10, 5), true
 }
 
 func submitOptions(args fireParams) (SubmitOptions, error) {

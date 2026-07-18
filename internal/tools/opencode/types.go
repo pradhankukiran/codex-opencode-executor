@@ -136,6 +136,22 @@ type HandoffCheckResult struct {
 	WorkspaceError     string            `json:"workspace_error,omitempty"`
 }
 
+// HandoffExecuteResult is the compact result of handoff_execute. It intentionally
+// omits workspace records, raw messages, paths, and diffs.
+type HandoffExecuteResult struct {
+	SessionID          string               `json:"session_id"`
+	Status             string               `json:"status,omitempty"`
+	Model              string               `json:"model,omitempty"`
+	Agent              string               `json:"agent,omitempty"`
+	FinalText          string               `json:"final_text,omitempty"`
+	FinalTextTruncated bool                 `json:"final_text_truncated,omitempty"`
+	PendingPermissions []RequestSummary     `json:"pending_permissions,omitempty"`
+	PendingQuestions   []RequestSummary     `json:"pending_questions,omitempty"`
+	JobError           string               `json:"job_error,omitempty"`
+	Errors             []string             `json:"errors,omitempty"`
+	Review             *HandoffReviewResult `json:"review,omitempty"`
+}
+
 // HandoffReviewResult is a compact workspace review for a session. It omits
 // full workspace paths/metadata and diffs; use handoff_workspace/handoff_diff
 // for those.
