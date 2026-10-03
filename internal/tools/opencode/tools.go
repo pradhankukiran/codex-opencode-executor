@@ -20,6 +20,8 @@ const maxJobTimeoutSeconds = 24 * 60 * 60
 const (
 	maxDiffChars                  = 100_000
 	maxVerificationTimeoutSeconds = 60 * 60
+
+	pendingPollInterval = 200 * time.Millisecond
 )
 
 // toolRegistrar binds a tool name to its MCP registration function.
@@ -407,7 +409,7 @@ func fireHandler(client *Client, mgr *Manager, workspaces *workspace.Manager, op
 			defer cancel()
 			// Wait on the local job lifecycle. OpenCode session wait can return
 			// while SubmitJob's prompt goroutine is still running.
-			_ = mgr.Wait(waitCtx, job.SessionID)
+			waitForTerminalOrPending(waitCtx, client, mgr, loc, job.SessionID)
 			if current, ok := mgr.Job(job.SessionID); ok {
 				res.Status = string(current.Status)
 				res.PromptMessageID = current.PromptMessageID
@@ -595,7 +597,7 @@ func executeHandler(client *Client, mgr *Manager, workspaces *workspace.Manager,
 		if prepared.waitSeconds > 0 {
 			waitCtx, cancel := context.WithTimeout(ctx, time.Duration(prepared.waitSeconds)*time.Second)
 			defer cancel()
-			waitForHandoffCheck(waitCtx, client, mgr, loc, created.SessionID)
+			waitForTerminalOrPending(waitCtx, client, mgr, loc, created.SessionID)
 		}
 
 		checkArgs := checkParams{
@@ -672,7 +674,7 @@ func checkHandler(client *Client, mgr *Manager, workspaces *workspace.Manager) m
 		if args.WaitSeconds > 0 {
 			waitCtx, cancel := context.WithTimeout(ctx, time.Duration(min(args.WaitSeconds, 300))*time.Second)
 			defer cancel()
-			waitForHandoffCheck(waitCtx, client, mgr, loc, args.SessionID)
+			waitForTerminalOrPending(waitCtx, client, mgr, loc, args.SessionID)
 		}
 
 		args.Directory = loc.Directory
@@ -690,43 +692,63 @@ func checkHandler(client *Client, mgr *Manager, workspaces *workspace.Manager) m
 	}
 }
 
-// waitForHandoffCheck blocks until a tracked job is truly complete for check
-// purposes, or the wait context expires.
+// waitForTerminalOrPending blocks until a tracked job is terminal with a
+// terminal OpenCode assistant finish, a pending permission/question request
+// appears, or ctx is done. It is the shared bounded-wait primitive used by
+// handoff_fire, handoff_check, and handoff_execute.
+//
+// For untracked sessions it falls back to client.Wait.
 //
 // Local Manager JobDone can race ahead of OpenCode's agent loop (latest assistant
 // finish still "tool-calls"/"unknown"). In that case we keep polling OpenCode
 // until the latest assistant turn is terminal rather than returning early.
-func waitForHandoffCheck(ctx context.Context, client *Client, mgr *Manager, loc Location, sessionID string) {
+func waitForTerminalOrPending(ctx context.Context, client *Client, mgr *Manager, loc Location, sessionID string) {
 	if _, tracked := mgr.Job(sessionID); !tracked {
 		_ = client.Wait(ctx, loc, sessionID)
 		return
 	}
 
-	_ = mgr.Wait(ctx, sessionID)
-	if ctx.Err() != nil {
-		return
-	}
-
-	ticker := time.NewTicker(100 * time.Millisecond)
+	ticker := time.NewTicker(pendingPollInterval)
 	defer ticker.Stop()
 	for {
-		if job, ok := mgr.Job(sessionID); ok {
-			switch job.Status {
-			case JobError, JobCanceled, JobTimedOut:
+		if ctx.Err() != nil {
+			return
+		}
+
+		job, ok := mgr.Job(sessionID)
+		if !ok {
+			return
+		}
+
+		switch job.Status {
+		case JobError, JobCanceled, JobTimedOut:
+			return
+		case JobDone:
+			// Verify the latest assistant finish is terminal before returning
+			// done; if OpenCode is still continuing (tool-calls/unknown), keep
+			// polling to preserve the JobDone vs tool-calls race semantics.
+			msg, err := client.Messages(ctx, loc, sessionID)
+			if err == nil {
+				if isSessionFinishedJSON(msg) {
+					return
+				}
+				// Local job may already be Done with empty messages (mocks) —
+				// no OpenCode continuation signal, so waiting further is
+				// unnecessary.
+				if !openCodeAssistantContinuing(msg) {
+					return
+				}
+			}
+		default:
+			// JobRunning/JobUnknown: return promptly when a permission or
+			// question needs a reply, so bounded waits do not stall on user
+			// input.
+			pending := fetchPending(ctx, client, loc, sessionID)
+			if len(pending.Permissions) > 0 || len(pending.Questions) > 0 {
 				return
 			}
 		}
-		msg, err := client.Messages(ctx, loc, sessionID)
-		if err == nil {
-			if isSessionFinishedJSON(msg) {
-				return
-			}
-			// Local job may already be Done with empty messages (mocks) — no
-			// OpenCode continuation signal, so waiting further is unnecessary.
-			if !openCodeAssistantContinuing(msg) {
-				return
-			}
-		}
+
 		select {
 		case <-ctx.Done():
 			return
@@ -1077,6 +1099,51 @@ type pendingRequests struct {
 	Errors      []string
 }
 
+// summarizeQuestionRequests extracts pending question summaries.
+// The generated question response nests the actual question text under each
+// request's "questions" array, so promote that text to a top-level "text"
+// field before the generic summarizeRequests filters by session and kind.
+func summarizeQuestionRequests(raw json.RawMessage, sessionID string) []RequestSummary {
+	// Accept both the API's wrapped response shape and Client.Questions' bare
+	// data list, promoting nested question text so summarizeRequests can surface it.
+	promoteQuestionText := func(list []map[string]any) {
+		for _, item := range list {
+			if qs, ok := item["questions"].([]any); ok {
+				var texts []string
+				for _, q := range qs {
+					if qm, ok := q.(map[string]any); ok {
+						if text := firstStringField(qm, "question", "header"); text != "" {
+							texts = append(texts, text)
+						}
+					}
+				}
+				if len(texts) > 0 {
+					item["text"] = strings.Join(texts, "\n")
+				}
+			}
+		}
+	}
+
+	var wrapper struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &wrapper); err == nil && wrapper.Data != nil {
+		promoteQuestionText(wrapper.Data)
+		if b, err := json.Marshal(wrapper); err == nil {
+			raw = b
+		}
+	} else {
+		var list []map[string]any
+		if err := json.Unmarshal(raw, &list); err == nil {
+			promoteQuestionText(list)
+			if b, err := json.Marshal(list); err == nil {
+				raw = b
+			}
+		}
+	}
+	return summarizeRequests(raw, "question", sessionID)
+}
+
 func fetchPending(ctx context.Context, client *Client, loc Location, sessionID string) pendingRequests {
 	var out pendingRequests
 	perms, err := client.Permissions(ctx, loc, sessionID)
@@ -1087,7 +1154,7 @@ func fetchPending(ctx context.Context, client *Client, loc Location, sessionID s
 	}
 	questions, err := client.Questions(ctx, loc, sessionID)
 	if err == nil {
-		out.Questions = summarizeRequests(questions, "question", sessionID)
+		out.Questions = summarizeQuestionRequests(questions, sessionID)
 	} else {
 		out.Errors = append(out.Errors, fmt.Sprintf("get questions: %s", err))
 	}

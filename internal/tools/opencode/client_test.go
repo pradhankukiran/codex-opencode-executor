@@ -2,6 +2,7 @@ package opencode
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -562,104 +563,167 @@ func TestClient_Context(t *testing.T) {
 func TestClient_Permissions(t *testing.T) {
 	t.Parallel()
 
-	handler := &HandlerMock{
-		V2PermissionRequestListFunc: func(ctx context.Context, params opencodeapi.V2PermissionRequestListParams) (opencodeapi.V2PermissionRequestListRes, error) {
-			return &opencodeapi.V2PermissionRequestListOK{
-				Data: []opencodeapi.PermissionV2Request{
-					{
-						ID:        "per-1",
-						Action:    "read_file",
-						SessionID: "ses-1",
-						Resources: []string{},
-					},
-				},
-			}, nil
-		},
-	}
-	client := setupTestServer(t, handler)
-	res, err := client.Permissions(t.Context(), Location{}, "ses-1")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, http.MethodGet, r.Method)
+		require.Equal(t, "/permission", r.URL.Path)
+		require.Equal(t, "/workspace", r.URL.Query().Get("directory"))
+		require.Equal(t, "ws-1", r.URL.Query().Get("workspace"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[
+			{"id":"per-1","sessionID":"ses-1","tool":"write file"},
+			{"id":"per-2","sessionID":"ses-2","tool":"read file"}
+		]`))
+	}))
+	t.Cleanup(server.Close)
+
+	client := newTestClient(t, Config{BaseURL: server.URL})
+	res, err := client.Permissions(t.Context(), Location{Directory: "/workspace", Workspace: "ws-1"}, "ses-1")
 	require.NoError(t, err)
 	require.Contains(t, string(res), `"per-1"`)
+	require.NotContains(t, string(res), `"per-2"`)
+}
+
+func TestClient_PermissionsValidation(t *testing.T) {
+	t.Parallel()
+
+	client := newTestClient(t, Config{BaseURL: "http://127.0.0.1:1"})
+	_, err := client.Permissions(t.Context(), Location{}, "")
+	require.EqualError(t, err, "session_id is required")
 }
 
 func TestClient_PermissionReply(t *testing.T) {
 	t.Parallel()
 
-	handler := &HandlerMock{
-		V2SessionPermissionReplyFunc: func(ctx context.Context, req *opencodeapi.V2SessionPermissionReplyReq, params opencodeapi.V2SessionPermissionReplyParams) (opencodeapi.V2SessionPermissionReplyRes, error) {
-			return &opencodeapi.V2SessionPermissionReplyNoContent{}, nil
-		},
+	type replyRequest struct {
+		Method    string
+		Path      string
+		Directory string
+		Workspace string
+		Reply     string
+		Message   string
 	}
-	client := setupTestServer(t, handler)
-	_, err := client.PermissionReply(t.Context(), Location{}, "ses-1", "per-1", "once", "ok")
+	requests := make(chan replyRequest, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, http.MethodPost, r.Method)
+		body, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		var decoded struct {
+			Reply   string `json:"reply"`
+			Message string `json:"message"`
+		}
+		require.NoError(t, json.Unmarshal(body, &decoded))
+		requests <- replyRequest{
+			Method:    r.Method,
+			Path:      r.URL.Path,
+			Directory: r.URL.Query().Get("directory"),
+			Workspace: r.URL.Query().Get("workspace"),
+			Reply:     decoded.Reply,
+			Message:   decoded.Message,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`true`))
+	}))
+	t.Cleanup(server.Close)
+
+	client := newTestClient(t, Config{BaseURL: server.URL})
+	_, err := client.PermissionReply(t.Context(), Location{Directory: "/workspace", Workspace: "ws-1"}, "ses-1", "per-1", "once", "ok")
 	require.NoError(t, err)
+
+	got := <-requests
+	require.Equal(t, "/permission/per-1/reply", got.Path)
+	require.Equal(t, "/workspace", got.Directory)
+	require.Equal(t, "ws-1", got.Workspace)
+	require.Equal(t, "once", got.Reply)
+	require.Equal(t, "ok", got.Message)
 }
 
 func TestClient_Questions(t *testing.T) {
 	t.Parallel()
 
-	handler := &HandlerMock{
-		V2QuestionRequestListFunc: func(ctx context.Context, params opencodeapi.V2QuestionRequestListParams) (opencodeapi.V2QuestionRequestListRes, error) {
-			return &opencodeapi.V2QuestionRequestListOK{
-				Data: []opencodeapi.QuestionV2Request{
-					{
-						ID:        "que-1",
-						SessionID: "ses-1",
-						Questions: []opencodeapi.QuestionV2Info{},
-					},
-				},
-			}, nil
-		},
-	}
-	client := setupTestServer(t, handler)
-	res, err := client.Questions(t.Context(), Location{}, "ses-1")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, http.MethodGet, r.Method)
+		require.Equal(t, "/question", r.URL.Path)
+		require.Equal(t, "/workspace", r.URL.Query().Get("directory"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[
+			{"id":"que-1","sessionID":"ses-1","questions":[{"question":"hello?"}]},
+			{"id":"que-2","sessionID":"ses-2","questions":[{"question":"bye?"}]}
+		]`))
+	}))
+	t.Cleanup(server.Close)
+
+	client := newTestClient(t, Config{BaseURL: server.URL})
+	res, err := client.Questions(t.Context(), Location{Directory: "/workspace"}, "ses-1")
 	require.NoError(t, err)
 	require.Contains(t, string(res), `"que-1"`)
+	require.NotContains(t, string(res), `"que-2"`)
+}
+
+func TestClient_QuestionsValidation(t *testing.T) {
+	t.Parallel()
+
+	client := newTestClient(t, Config{BaseURL: "http://127.0.0.1:1"})
+	_, err := client.Questions(t.Context(), Location{}, "")
+	require.EqualError(t, err, "session_id is required")
 }
 
 func TestClient_QuestionReply(t *testing.T) {
 	t.Parallel()
 
-	var rejected, replied bool
-	handler := &HandlerMock{
-		V2SessionQuestionRejectFunc: func(ctx context.Context, params opencodeapi.V2SessionQuestionRejectParams) (opencodeapi.V2SessionQuestionRejectRes, error) {
-			rejected = true
-			return &opencodeapi.V2SessionQuestionRejectNoContent{}, nil
-		},
-		V2SessionQuestionReplyFunc: func(ctx context.Context, req *opencodeapi.QuestionV2Reply, params opencodeapi.V2SessionQuestionReplyParams) (opencodeapi.V2SessionQuestionReplyRes, error) {
-			replied = true
-			return &opencodeapi.V2SessionQuestionReplyNoContent{}, nil
-		},
+	type questionRequest struct {
+		Method    string
+		Path      string
+		Directory string
+		Body      string
 	}
-	client := setupTestServer(t, handler)
+	requests := make(chan questionRequest, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		requests <- questionRequest{
+			Method:    r.Method,
+			Path:      r.URL.Path,
+			Directory: r.URL.Query().Get("directory"),
+			Body:      string(body),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`true`))
+	}))
+	t.Cleanup(server.Close)
 
-	_, err := client.QuestionReply(t.Context(), Location{}, "ses-1", "que-1", true, nil)
-	require.NoError(t, err)
-	require.True(t, rejected)
+	client := newTestClient(t, Config{BaseURL: server.URL})
 
-	_, err = client.QuestionReply(t.Context(), Location{}, "ses-1", "que-1", false, [][]string{{"ans1"}})
+	_, err := client.QuestionReply(t.Context(), Location{Directory: "/workspace"}, "ses-1", "que-1", true, nil)
 	require.NoError(t, err)
-	require.True(t, replied)
+	got := <-requests
+	require.Equal(t, http.MethodPost, got.Method)
+	require.Equal(t, "/question/que-1/reject", got.Path)
+	require.Equal(t, "/workspace", got.Directory)
+	require.Empty(t, got.Body)
+
+	_, err = client.QuestionReply(t.Context(), Location{Directory: "/workspace"}, "ses-1", "que-1", false, [][]string{{"ans1"}})
+	require.NoError(t, err)
+	got = <-requests
+	require.Equal(t, http.MethodPost, got.Method)
+	require.Equal(t, "/question/que-1/reply", got.Path)
+	require.Equal(t, "/workspace", got.Directory)
+	require.JSONEq(t, `{"answers":[["ans1"]]}`, got.Body)
 }
 
 func TestClient_SessionPermissionRequests(t *testing.T) {
 	t.Parallel()
 
-	handler := &HandlerMock{
-		V2SessionPermissionListFunc: func(ctx context.Context, params opencodeapi.V2SessionPermissionListParams) (opencodeapi.V2SessionPermissionListRes, error) {
-			return &opencodeapi.V2SessionPermissionListOK{
-				Data: []opencodeapi.PermissionV2Request{
-					{
-						ID:        "per-1",
-						Action:    "write_file",
-						SessionID: "ses-1",
-						Resources: []string{},
-					},
-				},
-			}, nil
-		},
-	}
-	client := setupTestServer(t, handler)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, http.MethodGet, r.Method)
+		require.Equal(t, "/permission", r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[
+			{"id":"per-1","session_id":"ses-1","tool":"write file"},
+			{"id":"per-2","sessionID":"ses-2","tool":"read file"}
+		]`))
+	}))
+	t.Cleanup(server.Close)
+
+	client := newTestClient(t, Config{BaseURL: server.URL})
 	res, err := client.SessionPermissionRequests(t.Context(), Location{}, "ses-1")
 	require.NoError(t, err)
 	require.Len(t, res, 1)
@@ -669,20 +733,18 @@ func TestClient_SessionPermissionRequests(t *testing.T) {
 func TestClient_SessionQuestionRequests(t *testing.T) {
 	t.Parallel()
 
-	handler := &HandlerMock{
-		V2QuestionRequestListFunc: func(ctx context.Context, params opencodeapi.V2QuestionRequestListParams) (opencodeapi.V2QuestionRequestListRes, error) {
-			return &opencodeapi.V2QuestionRequestListOK{
-				Data: []opencodeapi.QuestionV2Request{
-					{
-						ID:        "que-1",
-						SessionID: "ses-1",
-						Questions: []opencodeapi.QuestionV2Info{},
-					},
-				},
-			}, nil
-		},
-	}
-	client := setupTestServer(t, handler)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, http.MethodGet, r.Method)
+		require.Equal(t, "/question", r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[
+			{"id":"que-1","session_id":"ses-1","questions":[]},
+			{"id":"que-2","sessionID":"ses-2","questions":[]}
+		]`))
+	}))
+	t.Cleanup(server.Close)
+
+	client := newTestClient(t, Config{BaseURL: server.URL})
 	res, err := client.SessionQuestionRequests(t.Context(), Location{}, "ses-1")
 	require.NoError(t, err)
 	require.Len(t, res, 1)

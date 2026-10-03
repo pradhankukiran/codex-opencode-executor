@@ -607,57 +607,95 @@ func (c *Client) Context(ctx context.Context, _ Location, sessionID string) (jso
 	}
 }
 
-func (c *Client) Permissions(ctx context.Context, loc Location, _ string) (json.RawMessage, error) {
-	var params api.V2PermissionRequestListParams
-	var listLoc api.V2PermissionRequestListLocation
-	if dir := c.dir(loc); dir != "" {
-		listLoc.Directory = api.NewOptString(dir)
-	}
-	if loc.Workspace != "" {
-		listLoc.Workspace = api.NewOptString(loc.Workspace)
-	}
-	if listLoc.Directory.Set || listLoc.Workspace.Set {
-		params.Location = api.NewOptV2PermissionRequestListLocation(listLoc)
-	}
-
-	res, err := c.apiClient.V2PermissionRequestList(ctx, params)
+func (c *Client) Permissions(ctx context.Context, loc Location, sessionID string) (json.RawMessage, error) {
+	filtered, err := c.listLegacyRequests(ctx, loc, "/permission", sessionID)
 	if err != nil {
 		return nil, err
 	}
-	switch r := res.(type) {
-	case *api.V2PermissionRequestListOK:
-		raw, err := json.Marshal(r.Data)
-		if err != nil {
-			return nil, err
-		}
-		return json.RawMessage(raw), nil
-	case *api.InvalidRequestError:
-		return nil, fmt.Errorf("invalid request: %s", r.Message)
-	case *api.UnauthorizedError:
-		return nil, fmt.Errorf("unauthorized: %s", r.Message)
-	default:
-		return nil, fmt.Errorf("unexpected permission requests response: %T", res)
+	raw, err := json.Marshal(filtered)
+	if err != nil {
+		return nil, fmt.Errorf("marshal permissions: %w", err)
 	}
+	return json.RawMessage(raw), nil
 }
 
-func (c *Client) PermissionReply(ctx context.Context, _ Location, sessionID, requestID, reply, message string) (json.RawMessage, error) {
+func (c *Client) PermissionReply(ctx context.Context, loc Location, sessionID, requestID, reply, message string) (json.RawMessage, error) {
 	if requestID == "" {
 		return nil, fmt.Errorf("request_id is required")
 	}
 	if sessionID == "" {
 		return nil, fmt.Errorf("session_id is required")
 	}
+	switch reply {
+	case "once", "always", "reject":
+	default:
+		return nil, fmt.Errorf("invalid permission reply %q", reply)
+	}
 
-	var body api.V2SessionPermissionReplyReq
-	body.Reply = api.PermissionV2Reply(reply)
+	u, err := url.Parse(c.baseURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse opencode base URL: %w", err)
+	}
+	u.Path = strings.TrimRight(u.Path, "/") + "/permission/" + url.PathEscape(requestID) + "/reply"
+	query := u.Query()
+	if dir := c.dir(loc); dir != "" {
+		query.Set("directory", dir)
+	}
+	if loc.Workspace != "" {
+		query.Set("workspace", loc.Workspace)
+	}
+	u.RawQuery = query.Encode()
+
+	body := map[string]any{"reply": reply}
+	if message != "" {
+		body["message"] = message
+	}
+	bodyBytes, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("marshal permission reply body: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, fmt.Errorf("create permission reply request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	res, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("POST /permission/%s/reply: %w", requestID, err)
+	}
+	defer res.Body.Close()
+
+	resBody, err := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("read permission reply response: %w", err)
+	}
+	if res.StatusCode < http.StatusOK || res.StatusCode >= http.StatusMultipleChoices {
+		if isMissingRoute(res.StatusCode, resBody) {
+			return c.permissionReplyV2(ctx, sessionID, requestID, reply, message)
+		}
+		return nil, fmt.Errorf("POST /permission/%s/reply: status %s: %s", requestID, res.Status, strings.TrimSpace(string(resBody)))
+	}
+
+	var ok bool
+	if err := json.Unmarshal(resBody, &ok); err != nil {
+		return nil, fmt.Errorf("decode permission reply response: %w", err)
+	}
+	raw, err := json.Marshal(ok)
+	if err != nil {
+		return nil, fmt.Errorf("marshal permission reply result: %w", err)
+	}
+	return json.RawMessage(raw), nil
+}
+
+func (c *Client) permissionReplyV2(ctx context.Context, sessionID, requestID, reply, message string) (json.RawMessage, error) {
+	body := api.V2SessionPermissionReplyReq{Reply: api.PermissionV2Reply(reply)}
 	if message != "" {
 		body.Message = api.NewOptString(message)
 	}
-
-	var params api.V2SessionPermissionReplyParams
-	params.SessionID = sessionID
-	params.RequestID = requestID
-
+	params := api.V2SessionPermissionReplyParams{SessionID: sessionID, RequestID: requestID}
 	res, err := c.apiClient.V2SessionPermissionReply(ctx, &body, params)
 	if err != nil {
 		return nil, err
@@ -672,44 +710,23 @@ func (c *Client) PermissionReply(ctx context.Context, _ Location, sessionID, req
 	case *api.V2SessionPermissionReplyNotFoundApplicationJSON:
 		return nil, fmt.Errorf("permission request not found: %s", string(*r))
 	default:
-		return nil, fmt.Errorf("unexpected permission reply response: %T", res)
+		return nil, fmt.Errorf("unexpected v2 permission reply response: %T", res)
 	}
 }
 
-func (c *Client) Questions(ctx context.Context, loc Location, _ string) (json.RawMessage, error) {
-	var params api.V2QuestionRequestListParams
-	var listLoc api.V2QuestionRequestListLocation
-	if dir := c.dir(loc); dir != "" {
-		listLoc.Directory = api.NewOptString(dir)
-	}
-	if loc.Workspace != "" {
-		listLoc.Workspace = api.NewOptString(loc.Workspace)
-	}
-	if listLoc.Directory.Set || listLoc.Workspace.Set {
-		params.Location = api.NewOptV2QuestionRequestListLocation(listLoc)
-	}
-
-	res, err := c.apiClient.V2QuestionRequestList(ctx, params)
+func (c *Client) Questions(ctx context.Context, loc Location, sessionID string) (json.RawMessage, error) {
+	filtered, err := c.listLegacyRequests(ctx, loc, "/question", sessionID)
 	if err != nil {
 		return nil, err
 	}
-	switch r := res.(type) {
-	case *api.V2QuestionRequestListOK:
-		raw, err := json.Marshal(r.Data)
-		if err != nil {
-			return nil, err
-		}
-		return json.RawMessage(raw), nil
-	case *api.InvalidRequestError:
-		return nil, fmt.Errorf("invalid request: %s", r.Message)
-	case *api.UnauthorizedError:
-		return nil, fmt.Errorf("unauthorized: %s", r.Message)
-	default:
-		return nil, fmt.Errorf("unexpected question requests response: %T", res)
+	raw, err := json.Marshal(filtered)
+	if err != nil {
+		return nil, fmt.Errorf("marshal questions: %w", err)
 	}
+	return json.RawMessage(raw), nil
 }
 
-func (c *Client) QuestionReply(ctx context.Context, _ Location, sessionID, requestID string, reject bool, answers [][]string) (json.RawMessage, error) {
+func (c *Client) QuestionReply(ctx context.Context, loc Location, sessionID, requestID string, reject bool, answers [][]string) (json.RawMessage, error) {
 	if requestID == "" {
 		return nil, fmt.Errorf("request_id is required")
 	}
@@ -717,11 +734,80 @@ func (c *Client) QuestionReply(ctx context.Context, _ Location, sessionID, reque
 		return nil, fmt.Errorf("session_id is required")
 	}
 
-	if reject {
-		var params api.V2SessionQuestionRejectParams
-		params.SessionID = sessionID
-		params.RequestID = requestID
+	u, err := url.Parse(c.baseURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse opencode base URL: %w", err)
+	}
 
+	var route string
+	var bodyReader io.Reader = http.NoBody
+	if reject {
+		route = "/question/" + url.PathEscape(requestID) + "/reject"
+	} else {
+		route = "/question/" + url.PathEscape(requestID) + "/reply"
+		body := map[string]any{"answers": answers}
+		bodyBytes, err := json.Marshal(body)
+		if err != nil {
+			return nil, fmt.Errorf("marshal question reply body: %w", err)
+		}
+		bodyReader = bytes.NewReader(bodyBytes)
+	}
+
+	u.Path = strings.TrimRight(u.Path, "/") + route
+	query := u.Query()
+	if dir := c.dir(loc); dir != "" {
+		query.Set("directory", dir)
+	}
+	if loc.Workspace != "" {
+		query.Set("workspace", loc.Workspace)
+	}
+	u.RawQuery = query.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bodyReader)
+	if err != nil {
+		return nil, fmt.Errorf("create question reply request: %w", err)
+	}
+	if !reject {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	req.Header.Set("Accept", "application/json")
+
+	res, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("POST %s: %w", route, err)
+	}
+	defer res.Body.Close()
+
+	resBody, err := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("read question reply response: %w", err)
+	}
+	if res.StatusCode < http.StatusOK || res.StatusCode >= http.StatusMultipleChoices {
+		if isMissingRoute(res.StatusCode, resBody) {
+			return c.questionReplyV2(ctx, sessionID, requestID, reject, answers)
+		}
+		return nil, fmt.Errorf("POST %s: status %s: %s", route, res.Status, strings.TrimSpace(string(resBody)))
+	}
+
+	trimmed := bytes.TrimSpace(resBody)
+	if len(trimmed) == 0 {
+		return json.RawMessage("{}"), nil
+	}
+
+	var ok bool
+	if err := json.Unmarshal(resBody, &ok); err != nil {
+		return nil, fmt.Errorf("decode question reply response: %w", err)
+	}
+	raw, err := json.Marshal(ok)
+	if err != nil {
+		return nil, fmt.Errorf("marshal question reply result: %w", err)
+	}
+	return json.RawMessage(raw), nil
+}
+
+func (c *Client) questionReplyV2(ctx context.Context, sessionID, requestID string, reject bool, answers [][]string) (json.RawMessage, error) {
+	if reject {
+		params := api.V2SessionQuestionRejectParams{SessionID: sessionID, RequestID: requestID}
 		res, err := c.apiClient.V2SessionQuestionReject(ctx, params)
 		if err != nil {
 			return nil, err
@@ -736,21 +822,17 @@ func (c *Client) QuestionReply(ctx context.Context, _ Location, sessionID, reque
 		case *api.V2SessionQuestionRejectNotFoundApplicationJSON:
 			return nil, fmt.Errorf("question request not found: %s", string(*r))
 		default:
-			return nil, fmt.Errorf("unexpected question reject response: %T", res)
+			return nil, fmt.Errorf("unexpected v2 question reject response: %T", res)
 		}
 	}
 
-	var answersList []api.QuestionV2Answer
-	for _, ans := range answers {
-		answersList = append(answersList, api.QuestionV2Answer(ans))
+	v2Answers := make([]api.QuestionV2Answer, len(answers))
+	for i, answer := range answers {
+		v2Answers[i] = api.QuestionV2Answer(answer)
 	}
-	reqBody := api.QuestionV2Reply{Answers: answersList}
-
-	var params api.V2SessionQuestionReplyParams
-	params.SessionID = sessionID
-	params.RequestID = requestID
-
-	res, err := c.apiClient.V2SessionQuestionReply(ctx, &reqBody, params)
+	body := api.QuestionV2Reply{Answers: v2Answers}
+	params := api.V2SessionQuestionReplyParams{SessionID: sessionID, RequestID: requestID}
+	res, err := c.apiClient.V2SessionQuestionReply(ctx, &body, params)
 	if err != nil {
 		return nil, err
 	}
@@ -764,84 +846,156 @@ func (c *Client) QuestionReply(ctx context.Context, _ Location, sessionID, reque
 	case *api.V2SessionQuestionReplyNotFoundApplicationJSON:
 		return nil, fmt.Errorf("question request not found: %s", string(*r))
 	default:
-		return nil, fmt.Errorf("unexpected question reply response: %T", res)
+		return nil, fmt.Errorf("unexpected v2 question reply response: %T", res)
 	}
 }
 
-func (c *Client) SessionPermissionRequests(ctx context.Context, _ Location, sessionID string) ([]map[string]any, error) {
-	if sessionID == "" {
-		return nil, fmt.Errorf("sessionID is required")
-	}
-	var params api.V2SessionPermissionListParams
-	params.SessionID = sessionID
-
-	res, err := c.apiClient.V2SessionPermissionList(ctx, params)
-	if err != nil {
-		return nil, err
-	}
-	switch r := res.(type) {
-	case *api.V2SessionPermissionListOK:
-		raw, err := json.Marshal(r.Data)
-		if err != nil {
-			return nil, err
-		}
-		var list []map[string]any
-		if err := json.Unmarshal(raw, &list); err != nil {
-			return nil, err
-		}
-		return list, nil
-	case *api.InvalidRequestError:
-		return nil, fmt.Errorf("invalid request: %s", r.Message)
-	case *api.UnauthorizedError:
-		return nil, fmt.Errorf("unauthorized: %s", r.Message)
-	case *api.V2SessionPermissionListNotFoundApplicationJSON:
-		return nil, fmt.Errorf("session not found: %s", string(*r))
-	default:
-		return nil, fmt.Errorf("unexpected session permission list response: %T", res)
-	}
+func (c *Client) SessionPermissionRequests(ctx context.Context, loc Location, sessionID string) ([]map[string]any, error) {
+	return c.listLegacyRequests(ctx, loc, "/permission", sessionID)
 }
 
 func (c *Client) SessionQuestionRequests(ctx context.Context, loc Location, sessionID string) ([]map[string]any, error) {
-	var params api.V2QuestionRequestListParams
-	var listLoc api.V2QuestionRequestListLocation
-	if dir := c.dir(loc); dir != "" {
-		listLoc.Directory = api.NewOptString(dir)
-	}
-	if loc.Workspace != "" {
-		listLoc.Workspace = api.NewOptString(loc.Workspace)
-	}
-	if listLoc.Directory.Set || listLoc.Workspace.Set {
-		params.Location = api.NewOptV2QuestionRequestListLocation(listLoc)
+	return c.listLegacyRequests(ctx, loc, "/question", sessionID)
+}
+
+// listLegacyRequests fetches a legacy request list from route (e.g.
+// "/permission" or "/question") and returns only items whose sessionID matches
+// the requested session.
+func (c *Client) listLegacyRequests(ctx context.Context, loc Location, route, sessionID string) ([]map[string]any, error) {
+	if sessionID == "" {
+		return nil, fmt.Errorf("session_id is required")
 	}
 
-	res, err := c.apiClient.V2QuestionRequestList(ctx, params)
+	u, err := url.Parse(c.baseURL)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("parse opencode base URL: %w", err)
 	}
-	switch r := res.(type) {
-	case *api.V2QuestionRequestListOK:
-		raw, err := json.Marshal(r.Data)
+	u.Path = strings.TrimRight(u.Path, "/") + route
+	query := u.Query()
+	if dir := c.dir(loc); dir != "" {
+		query.Set("directory", dir)
+	}
+	if loc.Workspace != "" {
+		query.Set("workspace", loc.Workspace)
+	}
+	u.RawQuery = query.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("create %s request: %w", route, err)
+	}
+	req.Header.Set("Accept", "application/json")
+
+	res, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("GET %s: %w", route, err)
+	}
+	defer res.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("read %s response: %w", route, err)
+	}
+	if res.StatusCode < http.StatusOK || res.StatusCode >= http.StatusMultipleChoices {
+		// The live OpenCode 1.18.x tool permission system uses the legacy
+		// endpoints, while generated test servers and newer integrations may
+		// expose only the v2 request APIs. Keep legacy as the authoritative
+		// path, but retain v2 compatibility when the route does not exist.
+		if isMissingRoute(res.StatusCode, body) {
+			return c.listV2Requests(ctx, loc, route, sessionID)
+		}
+		return nil, fmt.Errorf("GET %s: status %s: %s", route, res.Status, strings.TrimSpace(string(body)))
+	}
+
+	var list []map[string]any
+	if err := json.Unmarshal(body, &list); err != nil {
+		return nil, fmt.Errorf("decode %s response: %w", route, err)
+	}
+
+	var filtered []map[string]any
+	for _, item := range list {
+		if item["sessionID"] == sessionID || item["session_id"] == sessionID {
+			filtered = append(filtered, item)
+		}
+	}
+	return filtered, nil
+}
+
+func isMissingRoute(status int, body []byte) bool {
+	return status == http.StatusNotFound && strings.TrimSpace(string(body)) == "404 page not found"
+}
+
+func (c *Client) listV2Requests(ctx context.Context, loc Location, route, sessionID string) ([]map[string]any, error) {
+	var raw []byte
+
+	switch route {
+	case "/permission":
+		res, err := c.apiClient.V2SessionPermissionList(ctx, api.V2SessionPermissionListParams{SessionID: sessionID})
 		if err != nil {
 			return nil, err
 		}
-		var list []map[string]any
-		if err := json.Unmarshal(raw, &list); err != nil {
+		switch r := res.(type) {
+		case *api.V2SessionPermissionListOK:
+			raw, err = json.Marshal(r.Data)
+			if err != nil {
+				return nil, fmt.Errorf("marshal v2 permission requests: %w", err)
+			}
+		case *api.InvalidRequestError:
+			return nil, fmt.Errorf("invalid request: %s", r.Message)
+		case *api.UnauthorizedError:
+			return nil, fmt.Errorf("unauthorized: %s", r.Message)
+		case *api.V2SessionPermissionListNotFoundApplicationJSON:
+			return nil, fmt.Errorf("session not found: %s", string(*r))
+		default:
+			return nil, fmt.Errorf("unexpected v2 permission list response: %T", res)
+		}
+
+	case "/question":
+		var params api.V2QuestionRequestListParams
+		var listLoc api.V2QuestionRequestListLocation
+		if dir := c.dir(loc); dir != "" {
+			listLoc.Directory = api.NewOptString(dir)
+		}
+		if loc.Workspace != "" {
+			listLoc.Workspace = api.NewOptString(loc.Workspace)
+		}
+		if listLoc.Directory.Set || listLoc.Workspace.Set {
+			params.Location = api.NewOptV2QuestionRequestListLocation(listLoc)
+		}
+
+		res, err := c.apiClient.V2QuestionRequestList(ctx, params)
+		if err != nil {
 			return nil, err
 		}
-		var filtered []map[string]any
-		for _, q := range list {
-			if q["sessionID"] == sessionID || q["session_id"] == sessionID {
-				filtered = append(filtered, q)
+		switch r := res.(type) {
+		case *api.V2QuestionRequestListOK:
+			raw, err = json.Marshal(r.Data)
+			if err != nil {
+				return nil, fmt.Errorf("marshal v2 question requests: %w", err)
 			}
+		case *api.InvalidRequestError:
+			return nil, fmt.Errorf("invalid request: %s", r.Message)
+		case *api.UnauthorizedError:
+			return nil, fmt.Errorf("unauthorized: %s", r.Message)
+		default:
+			return nil, fmt.Errorf("unexpected v2 question list response: %T", res)
 		}
-		return filtered, nil
-	case *api.InvalidRequestError:
-		return nil, fmt.Errorf("invalid request: %s", r.Message)
-	case *api.UnauthorizedError:
-		return nil, fmt.Errorf("unauthorized: %s", r.Message)
+
 	default:
-		return nil, fmt.Errorf("unexpected question request list response: %T", res)
+		return nil, fmt.Errorf("unsupported legacy request route %q", route)
 	}
+
+	var list []map[string]any
+	if err := json.Unmarshal(raw, &list); err != nil {
+		return nil, fmt.Errorf("decode v2 %s response: %w", route, err)
+	}
+	filtered := make([]map[string]any, 0, len(list))
+	for _, item := range list {
+		if item["sessionID"] == sessionID || item["session_id"] == sessionID {
+			filtered = append(filtered, item)
+		}
+	}
+	return filtered, nil
 }
 
 func (c *Client) Wait(ctx context.Context, _ Location, sessionID string) error {

@@ -211,8 +211,9 @@ func TestHandoffCheckWorkspaceOptIn(t *testing.T) {
 			require.NoError(t, json.Unmarshal([]byte(realisticDoneMessages), &resp))
 			return &resp, nil
 		},
-		V2PermissionRequestListFunc: func(context.Context, opencodeapi.V2PermissionRequestListParams) (opencodeapi.V2PermissionRequestListRes, error) {
-			return &opencodeapi.V2PermissionRequestListOK{Data: []opencodeapi.PermissionV2Request{}}, nil
+		V2SessionPermissionListFunc: func(_ context.Context, params opencodeapi.V2SessionPermissionListParams) (opencodeapi.V2SessionPermissionListRes, error) {
+			require.Equal(t, "ses-check-ws", params.SessionID)
+			return &opencodeapi.V2SessionPermissionListOK{Data: []opencodeapi.PermissionV2Request{}}, nil
 		},
 		V2QuestionRequestListFunc: func(context.Context, opencodeapi.V2QuestionRequestListParams) (opencodeapi.V2QuestionRequestListRes, error) {
 			return &opencodeapi.V2QuestionRequestListOK{Data: []opencodeapi.QuestionV2Request{}}, nil
@@ -241,8 +242,9 @@ func TestHandoffCheckMaxFinalCharsValidation(t *testing.T) {
 			require.NoError(t, json.Unmarshal([]byte(realisticDoneMessages), &resp))
 			return &resp, nil
 		},
-		V2PermissionRequestListFunc: func(context.Context, opencodeapi.V2PermissionRequestListParams) (opencodeapi.V2PermissionRequestListRes, error) {
-			return &opencodeapi.V2PermissionRequestListOK{Data: []opencodeapi.PermissionV2Request{}}, nil
+		V2SessionPermissionListFunc: func(_ context.Context, params opencodeapi.V2SessionPermissionListParams) (opencodeapi.V2SessionPermissionListRes, error) {
+			require.Equal(t, "ses-val", params.SessionID)
+			return &opencodeapi.V2SessionPermissionListOK{Data: []opencodeapi.PermissionV2Request{}}, nil
 		},
 		V2QuestionRequestListFunc: func(context.Context, opencodeapi.V2QuestionRequestListParams) (opencodeapi.V2QuestionRequestListRes, error) {
 			return &opencodeapi.V2QuestionRequestListOK{Data: []opencodeapi.QuestionV2Request{}}, nil
@@ -770,9 +772,6 @@ func TestToolHandlers(t *testing.T) {
 		},
 		V2SessionContextFunc: func(ctx context.Context, params opencodeapi.V2SessionContextParams) (opencodeapi.V2SessionContextRes, error) {
 			return &opencodeapi.V2SessionContextOK{Data: []opencodeapi.SessionMessage{}}, nil
-		},
-		V2PermissionRequestListFunc: func(ctx context.Context, params opencodeapi.V2PermissionRequestListParams) (opencodeapi.V2PermissionRequestListRes, error) {
-			return &opencodeapi.V2PermissionRequestListOK{Data: []opencodeapi.PermissionV2Request{}}, nil
 		},
 	}
 	client := setupTestServer(t, handler)

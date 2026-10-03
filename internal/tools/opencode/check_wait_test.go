@@ -31,9 +31,6 @@ func jobWaitHandlerMock(
 		V2SessionPermissionListFunc: func(context.Context, opencodeapi.V2SessionPermissionListParams) (opencodeapi.V2SessionPermissionListRes, error) {
 			return &opencodeapi.V2SessionPermissionListOK{Data: []opencodeapi.PermissionV2Request{}}, nil
 		},
-		V2PermissionRequestListFunc: func(context.Context, opencodeapi.V2PermissionRequestListParams) (opencodeapi.V2PermissionRequestListRes, error) {
-			return &opencodeapi.V2PermissionRequestListOK{Data: []opencodeapi.PermissionV2Request{}}, nil
-		},
 		V2QuestionRequestListFunc: func(context.Context, opencodeapi.V2QuestionRequestListParams) (opencodeapi.V2QuestionRequestListRes, error) {
 			return &opencodeapi.V2QuestionRequestListOK{Data: []opencodeapi.QuestionV2Request{}}, nil
 		},
@@ -256,9 +253,6 @@ func TestCheckHandlerWaitsThroughJobDoneToolCallsRace(t *testing.T) {
 		},
 		V2SessionPermissionListFunc: func(context.Context, opencodeapi.V2SessionPermissionListParams) (opencodeapi.V2SessionPermissionListRes, error) {
 			return &opencodeapi.V2SessionPermissionListOK{Data: []opencodeapi.PermissionV2Request{}}, nil
-		},
-		V2PermissionRequestListFunc: func(context.Context, opencodeapi.V2PermissionRequestListParams) (opencodeapi.V2PermissionRequestListRes, error) {
-			return &opencodeapi.V2PermissionRequestListOK{Data: []opencodeapi.PermissionV2Request{}}, nil
 		},
 		V2QuestionRequestListFunc: func(context.Context, opencodeapi.V2QuestionRequestListParams) (opencodeapi.V2QuestionRequestListRes, error) {
 			return &opencodeapi.V2QuestionRequestListOK{Data: []opencodeapi.QuestionV2Request{}}, nil
